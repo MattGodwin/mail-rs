@@ -302,4 +302,15 @@ mod tests {
             Err(e) => assert!(e.contains("No releases"), "unexpected error: {e}"),
         }
     }
+
+    /// Live download + checksum verification of the latest release (network).
+    #[test]
+    #[ignore]
+    fn live_download_verifies_checksum() {
+        let r = latest().expect("a published release");
+        let staged = download(&r).expect("download and verify");
+        assert!(staged.path.exists());
+        assert!(std::fs::metadata(&staged.path).unwrap().len() > 1_000_000);
+        let _ = std::fs::remove_dir_all(staged.path.parent().unwrap());
+    }
 }
