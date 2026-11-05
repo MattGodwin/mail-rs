@@ -40,6 +40,18 @@ Turn this off, or check manually, in **Settings → Updates**.
 - **You never lose a draft.** Compose windows are saved on this computer as you type and come
   back after a restart or crash. Server drafts keep Bcc and replace earlier versions, and
   quitting waits for anything still being sent.
+- **HTML email renders properly.** It uses the system web engine (WebView2 on Windows,
+  WebKit on macOS), locked down so scripts never run and remote images and trackers stay
+  blocked until you choose *Load remote content*. Links open in your browser.
+- **Common email types are handled:**
+  - calendar invitations (with *Add to calendar*);
+  - inline and attached images (with previews);
+  - forwarded emails attached as files, which open in the reader;
+  - `format=flowed` text;
+  - List-Unsubscribe headers (an *Unsubscribe* button);
+  - Chinese, Japanese, Korean, Thai and Indic text.
+- **Formats Mail can't fully open are explained instead of shown as confusing attachments:**
+  S/MIME and PGP signed or encrypted mail, and Outlook's `winmail.dat`.
 - Instant local filter, plus server-side search (press Enter in the filter box).
 - Save or open attachments (executables are save-only), or save the original `.eml`.
 - Keyboard driven (press `?` in the app).
@@ -51,8 +63,10 @@ Turn this off, or check manually, in **Settings → Updates**.
   and *View source* show exactly what the server sent.
 - **Opening a message is the only thing that marks it read.** Downloading or prefetching never
   changes read state on the server, and you can turn off mark-on-open in Settings.
-- **Remote content never loads.** HTML mail is shown as text in the app, so tracking pixels
-  never fire. *Open original in browser* opens the untouched HTML if you want it.
+- **Remote content stays off unless you allow it.** HTML mail is rendered from a display copy
+  served from memory. Scripts, forms and frames are blocked, and remote images, styles and
+  fonts (tracking pixels) are blocked unless you click *Load remote content* for that message.
+  The stored message is never altered.
 - **Outgoing mail is sent exactly as typed.** It's plain text; attachments and forwarded
   attachments go out unchanged.
 - **Deletes and moves only touch the messages you chose.** If a server can't remove just those
@@ -204,6 +218,8 @@ Removing an account deletes its cache and stored credentials. Nothing is deleted
 | `src/compose.rs` | Building messages and drafts, reply/forward, identities and aliases |
 | `src/drafts.rs` | Local recovery copies of unsent messages |
 | `src/view.rs` | Parsing a raw message for display, attachments, link detection |
+| `src/html.rs` | Sandboxed HTML rendering in the system web view (CSP, `cid:` images, link handling) |
+| `src/formats.rs` | format=flowed, calendar invitations, signed/encrypted/winmail.dat detection |
 | `src/store.rs` | On-disk cache (raw `.eml` files, folder indexes) |
 | `src/model.rs` | Shared types, IMAP modified UTF-7, formatting helpers |
 | `src/config.rs` | Accounts, settings, provider presets and setup guides |
@@ -215,7 +231,9 @@ Removing an account deletes its cache and stored credentials. Nothing is deleted
 ## Current limitations
 
 - Push watches the inbox. Other folders refresh while you're viewing them and on a timer.
-- HTML mail is rendered as text in the app; use *Open original in browser* for the full layout.
+- On Linux, HTML mail is shown as text; use *Open original in browser* for the full layout.
+  Windows and macOS render it in the app.
+- Encrypted (S/MIME or PGP) mail can't be decrypted yet, and signatures aren't verified.
 - Search uses the server's IMAP `SEARCH`; there's no local full-text index yet.
 - One message is selected at a time (no multi-select yet), and there's no conversation view.
 - On Windows, notifications show as coming from "Windows PowerShell" when running the portable
