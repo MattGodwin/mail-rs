@@ -160,9 +160,17 @@ for the mailbox:
 Set-CASMailbox -Identity user@yourdomain.com -ImapEnabled $true
 ```
 
-Both changes are per mailbox and can take up to an hour to apply. Security defaults or
-Conditional Access policies that block "legacy authentication" don't affect Mail, because Mail
-signs in with OAuth (modern authentication).
+Both changes are per mailbox and can take up to an hour to apply. They don't override
+organisation-wide policy:
+
+- **Security defaults** turn off SMTP AUTH for the whole organisation, even with OAuth. Sending
+  needs Security defaults turned off (with equivalent Conditional Access policies in their
+  place), or a different way to send.
+- **Conditional Access** policies can block Mail's sign-in or its IMAP/SMTP access. The sign-in
+  logs in Microsoft Entra show which policy applied.
+- "User is authenticated but not connected" can also mean the mailbox isn't licensed or
+  provisioned yet, or that the address is an alias of another mailbox. Mail lists these
+  possible causes rather than assuming IMAP is off.
 
 ## Keyboard shortcuts
 

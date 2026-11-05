@@ -76,19 +76,29 @@ pub fn classify(err: &str, client_id: &str, email: &str) -> Option<Issue> {
         };
         return Some(Issue { kind: Kind::Consent, short: "Needs IT admin approval", explain, copy_label, copy_text });
     }
-    if l.contains("5.7.139") || l.contains("smtpclientauthentication is disabled") {
+    // Only an explicit "SmtpClientAuthentication is disabled" is certain; other
+    // 5.7.139 replies can also mean Security defaults or Conditional Access.
+    if l.contains("smtpclientauthentication is disabled") {
         return Some(Issue {
             kind: Kind::SmtpAuthDisabled,
             short: "Sending blocked by IT admin",
-            explain:
-                "Your admin needs to enable SMTP AUTH for your mailbox so Mail can send. Send them this Exchange Online PowerShell command:"
-                    .into(),
+            explain: "Microsoft 365 says SMTP AUTH is turned off for your mailbox. Ask your IT admin to enable it with this Exchange Online PowerShell command. If Security defaults are on for your organisation, they also need to allow SMTP AUTH."
+                .into(),
             copy_label: "Copy command",
             copy_text: smtp_command(email),
         });
     }
-    if l.contains("user is authenticated but not connected")
-        || l.contains("imap is disabled")
+    if l.contains("5.7.139") {
+        return Some(Issue {
+            kind: Kind::SmtpAuthDisabled,
+            short: "Sending blocked by your organisation",
+            explain: "Microsoft 365 refused to let Mail send. Common causes: SMTP AUTH is turned off for the mailbox or organisation, Security defaults are on, or a Conditional Access policy blocks it. Your IT admin can check these. If SMTP AUTH is off for your mailbox, this command turns it on:"
+                .into(),
+            copy_label: "Copy command",
+            copy_text: smtp_command(email),
+        });
+    }
+    if l.contains("imap is disabled")
         || l.contains("imap access is disabled")
         || l.contains("imap is not enabled")
         || l.contains("imap protocol is disabled")
@@ -96,9 +106,18 @@ pub fn classify(err: &str, client_id: &str, email: &str) -> Option<Issue> {
         return Some(Issue {
             kind: Kind::ImapDisabled,
             short: "IMAP blocked by IT admin",
-            explain:
-                "Your admin needs to enable IMAP for your mailbox so Mail can read it. Send them this Exchange Online PowerShell command:"
-                    .into(),
+            explain: "Your mailbox has IMAP turned off. Ask your IT admin to enable it with this Exchange Online PowerShell command:"
+                .into(),
+            copy_label: "Copy command",
+            copy_text: imap_command(email),
+        });
+    }
+    if l.contains("user is authenticated but not connected") {
+        return Some(Issue {
+            kind: Kind::ImapDisabled,
+            short: "Mailbox not available over IMAP",
+            explain: "You signed in, but Microsoft 365 wouldn't open the mailbox. Common causes: IMAP is turned off for the mailbox, the mailbox isn't licensed or set up yet, or the address is an alias of another mailbox. Your IT admin can check these. If IMAP is off, this command turns it on:"
+                .into(),
             copy_label: "Copy command",
             copy_text: imap_command(email),
         });
@@ -129,6 +148,16 @@ mod tests {
         let smtp = "permanent error (535): 5.7.139 Authentication unsuccessful, SmtpClientAuthentication is disabled for the Mailbox.";
         let i = classify(smtp, "", "jo@contoso.com").unwrap();
         assert_eq!(i.kind, Kind::SmtpAuthDisabled);
+        assert_eq!(i.short, "Sending blocked by IT admin");
+        // Other 5.7.139 replies are reported with possible causes, not a diagnosis.
+        let other = classify(
+            "535 5.7.139 Authentication unsuccessful, user is locked by your organization's security defaults policy.",
+            "",
+            "jo@contoso.com",
+        )
+        .unwrap();
+        assert_eq!(other.short, "Sending blocked by your organisation");
+        assert!(other.explain.contains("Security defaults"));
         assert_eq!(i.copy_text, "Set-CASMailbox -Identity jo@contoso.com -SmtpClientAuthenticationDisabled $false");
         let imap = "No Response: AUTHENTICATE failed. User is authenticated but not connected.";
         assert_eq!(classify(imap, "", "jo@contoso.com").unwrap().copy_text, "Set-CASMailbox -Identity jo@contoso.com -ImapEnabled $true");

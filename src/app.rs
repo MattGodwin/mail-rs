@@ -2250,6 +2250,8 @@ impl App {
                 (&ed.smtp.host, ed.smtp.port, ed.smtp.security),
                 (&ed.client_id, &ed.client_secret),
                 (ed.save_sent, &ed.signature, &ed.aliases, ed.notify),
+                // A fresh browser sign-in is only kept once saved.
+                matches!(ed.oauth, OAuthState::Done(_)),
             )
         )
     }
@@ -3758,8 +3760,10 @@ impl App {
         // Docked composers sit bottom-right, side by side while they fit.
         let layout = compose_layout(ctx, screen, &self.composes);
         let mut acts = Vec::new();
+        let mut self_status_copied = false;
         let mut drop_target: Option<u64> = None;
-        let mut raise: Option<u64> = None;
+        // (composer, expanded) to bring forward after this frame.
+        let mut raise: Option<(u64, bool)> = None;
         // Drafts that don't fit on screen: one "More drafts" menu.
         if !layout.overflow.is_empty() {
             let (pos, w) = layout.more_at;
@@ -3780,7 +3784,7 @@ impl App {
                                 |ui| {
                                     for c in self.composes.iter().filter(|c| layout.overflow.contains(&c.id)) {
                                         if ui.button(c.title()).clicked() {
-                                            raise = Some(c.id);
+                                            raise = Some((c.id, false));
                                         }
                                     }
                                 },
@@ -3846,7 +3850,7 @@ impl App {
                         .or_else(|| (head.clicked() && tab).then_some((false, false)));
                     if let Some((m, e)) = toggled {
                         if tab && !m {
-                            raise = Some(id);
+                            raise = Some((id, e));
                         }
                         minimised = m;
                         expanded = e;
@@ -3869,166 +3873,162 @@ impl App {
                         let r = ui.available_rect_before_wrap();
                         ui.painter().hline((r.left() + 16.0)..=(r.right() - 16.0), r.top(), Stroke::new(1.0, p.divider));
                     };
-                    ui.add_enabled_ui(!locked, |ui| {
-                        row(ui, "From", &mut |ui| {
-                            let current = accts
-                                .iter()
-                                .find(|(i, _, _)| *i == c.acct)
-                                .and_then(|(_, _, ids)| ids.get(c.from).or(ids.first()).cloned())
-                                .unwrap_or_else(|| "Choose an account".into());
-                            egui::ComboBox::from_id_salt(("from", id))
-                                .icon(kit::combo_chevron)
-                                .selected_text(current)
-                                .width(ui.available_width() - 16.0)
-                                .show_ui(ui, |ui| {
-                                    for (i, _, ids) in &accts {
-                                        for (k, ident) in ids.iter().enumerate() {
-                                            if ui.selectable_label(c.acct == *i && c.from == k, ident).clicked() {
-                                                c.acct = *i;
-                                                c.from = k;
+                    // The error block's height from last frame (it sits just above the footer).
+                    let err_key = Id::unique(("compose-err-h", id));
+                    let err_h = if c.error.is_some() { ctx.data(|d| d.get_temp::<f32>(err_key)).unwrap_or(48.0) } else { 0.0 };
+                    let scroll_h = (ui.available_height() - 60.0 - err_h).max(40.0);
+                    egui::ScrollArea::vertical().id_salt(("cscroll", id)).max_height(scroll_h).auto_shrink([false, false]).show(ui, |ui| {
+                        let top = ui.cursor().top();
+                        ui.add_enabled_ui(!locked, |ui| {
+                            row(ui, "From", &mut |ui| {
+                                let current = accts
+                                    .iter()
+                                    .find(|(i, _, _)| *i == c.acct)
+                                    .and_then(|(_, _, ids)| ids.get(c.from).or(ids.first()).cloned())
+                                    .unwrap_or_else(|| "Choose an account".into());
+                                egui::ComboBox::from_id_salt(("from", id))
+                                    .icon(kit::combo_chevron)
+                                    .selected_text(current)
+                                    .width(ui.available_width() - 16.0)
+                                    .show_ui(ui, |ui| {
+                                        for (i, _, ids) in &accts {
+                                            for (k, ident) in ids.iter().enumerate() {
+                                                if ui.selectable_label(c.acct == *i && c.from == k, ident).clicked() {
+                                                    c.acct = *i;
+                                                    c.from = k;
+                                                }
                                             }
                                         }
-                                    }
+                                    });
+                            });
+                            let focus_to = c.focus && c.to.is_empty();
+                            let show_cc = c.show_cc;
+                            row(ui, "To", &mut |ui| {
+                                let w = ui.available_width() - if show_cc { 16.0 } else { 84.0 };
+                                let r = ui.add(flat_edit(&mut c.to, "Recipients", w));
+                                if focus_to {
+                                    r.request_focus();
+                                }
+                                if !show_cc && ui.add(egui::Button::new(RichText::new("Cc/Bcc").color(p.accent)).frame(false)).clicked() {
+                                    c.show_cc = true;
+                                }
+                            });
+                            if c.show_cc {
+                                row(ui, "Cc", &mut |ui| {
+                                    let w = ui.available_width() - 16.0;
+                                    ui.add(flat_edit(&mut c.cc, "", w));
                                 });
-                        });
-                        let focus_to = c.focus && c.to.is_empty();
-                        let show_cc = c.show_cc;
-                        row(ui, "To", &mut |ui| {
-                            let w = ui.available_width() - if show_cc { 16.0 } else { 84.0 };
-                            let r = ui.add(flat_edit(&mut c.to, "Recipients", w));
-                            if focus_to {
-                                r.request_focus();
+                                row(ui, "Bcc", &mut |ui| {
+                                    let w = ui.available_width() - 16.0;
+                                    ui.add(flat_edit(&mut c.bcc, "", w));
+                                });
                             }
-                            if !show_cc && ui.add(egui::Button::new(RichText::new("Cc/Bcc").color(p.accent)).frame(false)).clicked() {
-                                c.show_cc = true;
-                            }
-                        });
-                        if c.show_cc {
-                            row(ui, "Cc", &mut |ui| {
+                            row(ui, "Subject", &mut |ui| {
                                 let w = ui.available_width() - 16.0;
-                                ui.add(flat_edit(&mut c.cc, "", w));
+                                ui.add(flat_edit(&mut c.subject, "", w));
                             });
-                            row(ui, "Bcc", &mut |ui| {
-                                let w = ui.available_width() - 16.0;
-                                ui.add(flat_edit(&mut c.bcc, "", w));
-                            });
-                        }
-                        row(ui, "Subject", &mut |ui| {
-                            let w = ui.available_width() - 16.0;
-                            ui.add(flat_edit(&mut c.subject, "", w));
-                        });
-                        let focus_body = c.focus && !c.to.is_empty();
-                        c.focus = false;
+                            let focus_body = c.focus && !c.to.is_empty();
+                            c.focus = false;
 
-                        let has_files = !c.files.is_empty() || !c.carried.is_empty();
-                        let from_addr = accts
-                            .iter()
-                            .find(|(i, _, _)| *i == c.acct)
-                            .and_then(|(_, _, ids)| ids.get(c.from).or(ids.first()))
-                            .map(|a| compose::bare(a))
-                            .unwrap_or_default();
-                        let admin_issue = c.error.as_deref().and_then(|e| crate::admin::classify(e, "", &from_addr));
-                        let status_h = match (&c.error, &admin_issue) {
-                            (_, Some(_)) => 140.0,
-                            (Some(_), None) => 44.0,
-                            _ => 0.0,
-                        };
-                        let footer_h = 60.0 + status_h + if has_files { 48.0 } else { 0.0 };
-                        egui::Frame::new().inner_margin(egui::Margin { left: 16, right: 8, top: 8, bottom: 0 }).show(ui, |ui| {
-                            egui::ScrollArea::vertical()
-                                .id_salt(("cbody", id))
-                                .max_height((ui.available_height() - footer_h).max(48.0))
-                                .auto_shrink([false, false])
-                                .show(ui, |ui| {
-                                    let r = ui.add(
-                                        egui::TextEdit::multiline(&mut c.body)
-                                            .frame(egui::Frame::NONE)
-                                            .desired_width(f32::INFINITY)
-                                            .desired_rows(12)
-                                            .font(theme::regular(ty::BODY)),
-                                    );
-                                    if focus_body {
-                                        r.request_focus();
-                                        if let Some(mut st) = egui::TextEdit::load_state(ui.ctx(), r.id) {
-                                            st.cursor.set_char_range(Some(egui::text::CCursorRange::one(egui::text::CCursor::new(0))));
-                                            st.store(ui.ctx(), r.id);
+                            let has_files = !c.files.is_empty() || !c.carried.is_empty();
+                            if has_files {
+                                ui.horizontal_wrapped(|ui| {
+                                    ui.add_space(12.0);
+                                    ui.spacing_mut().item_spacing = egui::vec2(6.0, 6.0);
+                                    let mut remove_file = None;
+                                    let mut remove_carried = None;
+                                    let chip = |ui: &mut egui::Ui, name: &str, size: usize, tip: &str| -> bool {
+                                        let mut remove = false;
+                                        egui::Frame::new()
+                                            .fill(p.window)
+                                            .stroke(Stroke::new(1.0, p.divider))
+                                            .corner_radius(egui::CornerRadius::same(6))
+                                            .inner_margin(egui::Margin { left: 8, right: 0, top: 0, bottom: 0 })
+                                            .show(ui, |ui| {
+                                                ui.horizontal(|ui| {
+                                                    ui.spacing_mut().item_spacing.x = 4.0;
+                                                    ui.label(kit::glyph(ic::ICON_ATTACH_FILE, 16.0, p.text_secondary));
+                                                    let g = kit::one_line(
+                                                        ui,
+                                                        format!("{name} · {}", model::fmt_size(size)),
+                                                        theme::regular(ty::META + 1.0),
+                                                        p.text,
+                                                        180.0,
+                                                    );
+                                                    ui.label(g).on_hover_text(tip);
+                                                    remove = kit::icon_button(ui, ic::ICON_CLOSE, "Remove attachment").clicked();
+                                                });
+                                            });
+                                        remove
+                                    };
+                                    for (i, f) in c.files.iter().enumerate() {
+                                        let name = f.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default();
+                                        let size = std::fs::metadata(f).map(|m| m.len() as usize).unwrap_or(0);
+                                        if chip(ui, &name, size, &f.display().to_string()) {
+                                            remove_file = Some(i);
                                         }
                                     }
+                                    for (i, (name, _, data)) in c.carried.iter().enumerate() {
+                                        if chip(ui, name, data.len(), name) {
+                                            remove_carried = Some(i);
+                                        }
+                                    }
+                                    if let Some(i) = remove_file {
+                                        c.files.remove(i);
+                                    }
+                                    if let Some(i) = remove_carried {
+                                        c.carried.remove(i);
+                                        c.carried_dirty = true;
+                                    }
                                 });
-                        });
-
-                        if has_files {
-                            ui.horizontal_wrapped(|ui| {
-                                ui.add_space(12.0);
-                                ui.spacing_mut().item_spacing = egui::vec2(6.0, 6.0);
-                                let mut remove_file = None;
-                                let mut remove_carried = None;
-                                let chip = |ui: &mut egui::Ui, name: &str, size: usize, tip: &str| -> bool {
-                                    let mut remove = false;
-                                    egui::Frame::new()
-                                        .fill(p.window)
-                                        .stroke(Stroke::new(1.0, p.divider))
-                                        .corner_radius(egui::CornerRadius::same(6))
-                                        .inner_margin(egui::Margin { left: 8, right: 0, top: 0, bottom: 0 })
-                                        .show(ui, |ui| {
-                                            ui.horizontal(|ui| {
-                                                ui.spacing_mut().item_spacing.x = 4.0;
-                                                ui.label(kit::glyph(ic::ICON_ATTACH_FILE, 16.0, p.text_secondary));
-                                                let g = kit::one_line(
-                                                    ui,
-                                                    format!("{name} · {}", model::fmt_size(size)),
-                                                    theme::regular(ty::META + 1.0),
-                                                    p.text,
-                                                    180.0,
-                                                );
-                                                ui.label(g).on_hover_text(tip);
-                                                remove = kit::icon_button(ui, ic::ICON_CLOSE, "Remove attachment").clicked();
-                                            });
-                                        });
-                                    remove
-                                };
-                                for (i, f) in c.files.iter().enumerate() {
-                                    let name = f.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default();
-                                    let size = std::fs::metadata(f).map(|m| m.len() as usize).unwrap_or(0);
-                                    if chip(ui, &name, size, &f.display().to_string()) {
-                                        remove_file = Some(i);
+                            }
+                            // The body fills the rest of the view and grows with its text.
+                            let used = ui.cursor().top() - top;
+                            let body_h = (scroll_h - used - 8.0).max(96.0);
+                            egui::Frame::new().inner_margin(egui::Margin { left: 16, right: 8, top: 8, bottom: 0 }).show(ui, |ui| {
+                                let r = ui.add(
+                                    egui::TextEdit::multiline(&mut c.body)
+                                        .frame(egui::Frame::NONE)
+                                        .desired_width(f32::INFINITY)
+                                        .min_size(egui::vec2(0.0, body_h))
+                                        .font(theme::regular(ty::BODY)),
+                                );
+                                if focus_body {
+                                    r.request_focus();
+                                    if let Some(mut st) = egui::TextEdit::load_state(ui.ctx(), r.id) {
+                                        st.cursor.set_char_range(Some(egui::text::CCursorRange::one(egui::text::CCursor::new(0))));
+                                        st.store(ui.ctx(), r.id);
                                     }
-                                }
-                                for (i, (name, _, data)) in c.carried.iter().enumerate() {
-                                    if chip(ui, name, data.len(), name) {
-                                        remove_carried = Some(i);
-                                    }
-                                }
-                                if let Some(i) = remove_file {
-                                    c.files.remove(i);
-                                }
-                                if let Some(i) = remove_carried {
-                                    c.carried.remove(i);
-                                    c.carried_dirty = true;
                                 }
                             });
-                        }
+                        });
                     });
 
                     if let Some(e) = &c.error {
+                        let before = ui.cursor().top();
                         let from_addr = accts
                             .iter()
                             .find(|(i, _, _)| *i == c.acct)
                             .and_then(|(_, _, ids)| ids.get(c.from).or(ids.first()))
                             .map(|a| compose::bare(a))
                             .unwrap_or_default();
-                        ui.add_space(4.0);
-                        ui.horizontal(|ui| {
-                            ui.add_space(12.0);
-                            ui.allocate_ui(egui::vec2(ui.available_width() - 12.0, 0.0), |ui| {
-                                match crate::admin::classify(e, "", &from_addr).as_ref() {
-                                    Some(issue) => admin_card(ui, issue),
-                                    None => {
-                                        kit::notice(ui, Tone::Error, e, None);
+                        // Compact here: the composer must keep its Send bar in view.
+                        egui::Frame::new().inner_margin(egui::Margin { left: 12, right: 12, top: 4, bottom: 0 }).show(ui, |ui| {
+                            match crate::admin::classify(e, "", &from_addr) {
+                                Some(issue) => {
+                                    let text = format!("{}. Copy the fix to send to your IT admin.", issue.short);
+                                    if kit::notice(ui, Tone::Warning, &text, Some(issue.copy_label)) {
+                                        ui.ctx().copy_text(issue.copy_text.clone());
+                                        self_status_copied = true;
                                     }
                                 }
-                            });
+                                None => {
+                                    kit::notice(ui, Tone::Error, e, None);
+                                }
+                            }
                         });
+                        let h = ui.cursor().top() - before;
+                        ctx.data_mut(|d| d.insert_temp(err_key, h));
                     }
                     // Footer: Send, Attach, Save draft · status ……… Discard
                     ui.horizontal(|ui| {
@@ -4084,11 +4084,14 @@ impl App {
                 }
             }
         }
-        if let Some(id) = raise {
-            // Restored: un-minimise and bring to the front of the docked row.
+        if self_status_copied {
+            self.status = "Copied. Send it to your IT admin.".into();
+        }
+        if let Some((id, expanded)) = raise {
+            // Restored: un-minimise and bring to the front of the docked row (or expand it).
             ctx.data_mut(|d| {
                 let st_id = Id::unique(("compose-state", id));
-                d.insert_temp(st_id, (false, false));
+                d.insert_temp(st_id, (false, expanded));
                 d.insert_temp(Id::unique(("compose-raised", id)), ctx.cumulative_pass_nr());
             });
         }
@@ -4432,257 +4435,254 @@ impl App {
                 });
                 ui.add_space(16.0);
                 let submit = ui.memory_mut(|m| m.data.remove_temp::<bool>(Id::unique("setup-submit"))).unwrap_or(false);
-                // Small windows: the step scrolls, never taller than the window.
+                // Short windows: the step scrolls in a box that fits the window.
                 let max_h = (ctx.content_rect().height() - 32.0 - 56.0 - 40.0).max(120.0);
-                egui::ScrollArea::vertical().id_salt("setup-scroll").max_height(max_h).auto_shrink([false, true]).show(ui, |ui| {
-                    match st.step {
-                        SetupStep::Email | SetupStep::Detecting => {
-                            kit::section_title(ui, "Add an email account");
-                            ui.label(RichText::new("Email address").color(p.text_secondary));
-                            let r = ui.add_enabled(
-                                st.step == SetupStep::Email,
-                                kit::text_field(&mut st.ed.email, "you@example.com")
-                                    .desired_width(f32::INFINITY)
-                                    .id(Id::unique("setup-email")),
-                            );
-                            if st.step == SetupStep::Email && !r.has_focus() && st.ed.email.is_empty() {
-                                r.request_focus();
-                            }
-                            let enter = r.lost_focus() && ui.input(|i| i.key_pressed(K::Enter));
-                            if let Some(e) = &st.error {
-                                ui.add_space(8.0);
-                                kit::notice(ui, Tone::Error, e, None);
-                            }
-                            ui.add_space(20.0);
-                            ui.horizontal(|ui| {
-                                if st.step == SetupStep::Detecting {
-                                    ui.add(egui::Spinner::new().size(16.0).color(p.text_secondary));
-                                    ui.label(RichText::new("Finding your settings…").color(p.text_secondary));
-                                } else if ui.add(egui::Button::new(RichText::new("Set up manually").color(p.accent)).frame(false)).clicked()
-                                {
-                                    let email = st.ed.email.trim().to_string();
-                                    if !crate::autoconfig::looks_like_email(&email) {
-                                        st.error = Some("Enter your email address first.".into());
-                                        ui.memory_mut(|m| m.request_focus(Id::unique("setup-email")));
-                                    } else {
-                                        st.error = None;
-                                        Self::apply_preset(&mut st.ed, Provider::Custom, &settings);
-                                        st.ed.username = email;
-                                        st.step = SetupStep::Manual;
-                                    }
-                                }
-                                ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
-                                    let ok = crate::autoconfig::looks_like_email(st.ed.email.trim()) && st.step == SetupStep::Email;
-                                    if ui.add_enabled_ui(ok, |ui| kit::primary_button(ui, None, "Continue")).inner.clicked()
-                                        || (enter && ok)
-                                    {
-                                        continue_email = true;
-                                    }
-                                    if kit::secondary_button(ui, "Cancel").clicked() {
-                                        close = true;
-                                    }
-                                });
-                            });
-                            if continue_email {
-                                let email = st.ed.email.trim().to_ascii_lowercase();
-                                if existing.iter().any(|(e, _)| *e == email) {
-                                    st.error = Some(format!("{email} is already added. Edit it in Settings › Accounts."));
-                                    continue_email = false;
+                let short = max_h < 520.0;
+                let mut body = |ui: &mut egui::Ui| match st.step {
+                    SetupStep::Email | SetupStep::Detecting => {
+                        kit::section_title(ui, "Add an email account");
+                        ui.label(RichText::new("Email address").color(p.text_secondary));
+                        let r = ui.add_enabled(
+                            st.step == SetupStep::Email,
+                            kit::text_field(&mut st.ed.email, "you@example.com").desired_width(f32::INFINITY).id(Id::unique("setup-email")),
+                        );
+                        if st.step == SetupStep::Email && !r.has_focus() && st.ed.email.is_empty() {
+                            r.request_focus();
+                        }
+                        let enter = r.lost_focus() && ui.input(|i| i.key_pressed(K::Enter));
+                        if let Some(e) = &st.error {
+                            ui.add_space(8.0);
+                            kit::notice(ui, Tone::Error, e, None);
+                        }
+                        ui.add_space(20.0);
+                        ui.horizontal(|ui| {
+                            if st.step == SetupStep::Detecting {
+                                ui.add(egui::Spinner::new().size(16.0).color(p.text_secondary));
+                                ui.label(RichText::new("Finding your settings…").color(p.text_secondary));
+                            } else if ui.add(egui::Button::new(RichText::new("Set up manually").color(p.accent)).frame(false)).clicked() {
+                                let email = st.ed.email.trim().to_string();
+                                if !crate::autoconfig::looks_like_email(&email) {
+                                    st.error = Some("Enter your email address first.".into());
+                                    ui.memory_mut(|m| m.request_focus(Id::unique("setup-email")));
                                 } else {
                                     st.error = None;
-                                    if !st.ed.username_touched {
-                                        st.ed.username = st.ed.email.trim().to_string();
-                                    }
-                                }
-                            }
-                        }
-                        SetupStep::SignIn => {
-                            kit::section_title(ui, "Sign in");
-                            ui.label(RichText::new(&st.ed.email).color(p.text));
-                            ui.label(RichText::new(&st.detected).size(ty::META).color(p.text_secondary));
-                            ui.add_space(12.0);
-                            Self::signin_controls(ui, &mut st.ed, &mut st.show_password, &settings, &tx);
-                            ui.add_space(12.0);
-                            ui.label(RichText::new("Your name (shown to people you email)").color(p.text_secondary));
-                            ui.add(kit::text_field(&mut st.ed.name, "Optional").desired_width(f32::INFINITY));
-                            if let Some(e) = &st.error {
-                                ui.add_space(8.0);
-                                kit::notice(ui, Tone::Error, e, None);
-                            }
-                            ui.add_space(20.0);
-                            ui.horizontal(|ui| {
-                                if ui.add(egui::Button::new(RichText::new("Server settings").color(p.accent)).frame(false)).clicked() {
+                                    Self::apply_preset(&mut st.ed, Provider::Custom, &settings);
+                                    st.ed.username = email;
                                     st.step = SetupStep::Manual;
                                 }
-                                ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
-                                    let ready = match st.ed.auth {
-                                        AuthKind::Password => !st.ed.password.is_empty(),
-                                        _ => matches!(st.ed.oauth, OAuthState::Done(_)),
-                                    };
-                                    if ui.add_enabled_ui(ready, |ui| kit::primary_button(ui, None, "Continue")).inner.clicked()
-                                        || (submit && ready)
-                                    {
-                                        verify = true;
-                                    }
-                                    if kit::secondary_button(ui, "Back").clicked() {
-                                        st.step = SetupStep::Email;
-                                    }
-                                });
-                            });
-                        }
-                        SetupStep::Manual => {
-                            ui.horizontal(|ui| {
-                                ui.label(kit::glyph(ic::ICON_MAIL, 18.0, p.text_secondary));
-                                ui.label(RichText::new(st.ed.email.trim()).color(p.text));
-                                if ui.add(egui::Button::new(RichText::new("Change").color(p.accent)).frame(false)).clicked() {
-                                    st.step = SetupStep::Email;
-                                    st.error = None;
+                            }
+                            ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                                let ok = crate::autoconfig::looks_like_email(st.ed.email.trim()) && st.step == SetupStep::Email;
+                                if ui.add_enabled_ui(ok, |ui| kit::primary_button(ui, None, "Continue")).inner.clicked() || (enter && ok) {
+                                    continue_email = true;
+                                }
+                                if kit::secondary_button(ui, "Cancel").clicked() {
+                                    close = true;
                                 }
                             });
-                            ui.add_space(8.0);
-                            kit::section_title(ui, "Server settings");
-                            if !st.detected.is_empty() {
-                                ui.label(RichText::new(&st.detected).size(ty::META + 1.0).color(p.text_secondary));
-                                ui.add_space(8.0);
-                            }
-                            Self::server_form(ui, &mut st.ed);
-                            ui.add_space(12.0);
-                            Self::signin_controls(ui, &mut st.ed, &mut st.show_password, &settings, &tx);
-                            if let Some(e) = &st.error {
-                                ui.add_space(8.0);
-                                kit::notice(ui, Tone::Error, e, None);
-                            }
-                            ui.add_space(20.0);
-                            ui.horizontal(|ui| {
-                                ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
-                                    let ok = !st.ed.imap.host.trim().is_empty() && !st.ed.smtp.host.trim().is_empty();
-                                    if ui.add_enabled_ui(ok, |ui| kit::primary_button(ui, None, "Continue")).inner.clicked()
-                                        || (submit && ok)
-                                    {
-                                        verify = true;
-                                    }
-                                    if kit::secondary_button(ui, "Back").clicked() {
-                                        st.step = SetupStep::Email;
-                                    }
-                                });
-                            });
-                        }
-                        SetupStep::Verify => {
-                            kit::section_title(ui, "Checking your account");
-                            let row = |ui: &mut egui::Ui, label: &str, check: &Check| {
-                                ui.horizontal(|ui| {
-                                    match check {
-                                        Check::Running | Check::Waiting => {
-                                            ui.add(egui::Spinner::new().size(18.0).color(p.text_secondary));
-                                        }
-                                        Check::Ok => {
-                                            ui.label(kit::glyph(ic::ICON_CHECK_CIRCLE, 20.0, p.success));
-                                        }
-                                        Check::Failed(_) => {
-                                            ui.label(kit::glyph(ic::ICON_ERROR, 20.0, p.error));
-                                        }
-                                    }
-                                    ui.label(RichText::new(label).color(p.text));
-                                });
-                                if let Check::Failed(e) = check {
-                                    ui.horizontal(|ui| {
-                                        ui.add_space(28.0);
-                                        ui.add(egui::Label::new(RichText::new(e).size(ty::META + 1.0).color(p.text_secondary)).wrap());
-                                    });
-                                }
-                                ui.add_space(6.0);
-                            };
-                            ui.horizontal(|ui| {
-                                ui.label(kit::glyph(ic::ICON_CHECK_CIRCLE, 20.0, p.success));
-                                ui.label(RichText::new("Found settings").color(p.text));
-                            });
-                            ui.add_space(6.0);
-                            row(ui, "Signed in to incoming mail", &st.incoming);
-                            row(ui, "Signed in to outgoing mail", &st.outgoing);
-                            let failed = matches!(st.incoming, Check::Failed(_)) || matches!(st.outgoing, Check::Failed(_));
-                            if let Some(issue) = st.admin.as_ref().filter(|_| failed) {
-                                ui.add_space(8.0);
-                                admin_card(ui, issue);
-                            }
-                            if let Some(e) = &st.error {
-                                kit::notice(ui, Tone::Error, e, None);
-                            }
-                            ui.add_space(20.0);
-                            ui.horizontal(|ui| {
-                                if failed
-                                    && ui
-                                        .add(egui::Button::new(RichText::new("Edit server settings").color(p.accent)).frame(false))
-                                        .clicked()
-                                {
-                                    st.step = SetupStep::Manual;
-                                }
-                                ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
-                                    if failed {
-                                        if kit::primary_button(ui, None, "Try again").clicked() {
-                                            verify = true;
-                                        }
-                                        if kit::secondary_button(ui, "Back").clicked() {
-                                            st.step = SetupStep::SignIn;
-                                        }
-                                    } else if kit::secondary_button(ui, "Cancel").clicked() {
-                                        close = true;
-                                    }
-                                });
-                            });
-                        }
-                        SetupStep::Done => {
-                            ui.horizontal(|ui| {
-                                ui.label(kit::glyph(ic::ICON_CHECK_CIRCLE, 28.0, p.success));
-                                ui.label(
-                                    RichText::new(format!("{} is ready", st.ed.email.trim()))
-                                        .font(theme::semibold(ty::HEADING))
-                                        .color(p.text),
-                                );
-                            });
-                            ui.add_space(4.0);
-                            ui.label(RichText::new("Your mail is syncing now.").color(p.text_secondary));
-                            ui.add_space(16.0);
-                            if let Some(i) = st.added {
-                                if let Some(a) = self.accts.get_mut(i) {
-                                    ui.label(RichText::new("Signature (optional)").color(p.text_secondary));
-                                    if ui
-                                        .add(
-                                            egui::TextEdit::multiline(&mut a.cfg.signature)
-                                                .desired_rows(3)
-                                                .desired_width(f32::INFINITY)
-                                                .margin(egui::Margin::same(8)),
-                                        )
-                                        .changed()
-                                    {
-                                        self.cfg
-                                            .accounts
-                                            .iter_mut()
-                                            .filter(|x| x.id == a.cfg.id)
-                                            .for_each(|x| x.signature = a.cfg.signature.clone());
-                                    }
-                                    ui.add_space(8.0);
-                                    let mut n = a.cfg.notify;
-                                    if kit::switch_labeled(ui, &mut n, "Notify me about new mail") {
-                                        a.cfg.notify = n;
-                                        a.shared.notify.store(settings.notifications && n, Ordering::Relaxed);
-                                    }
+                        });
+                        if continue_email {
+                            let email = st.ed.email.trim().to_ascii_lowercase();
+                            if existing.iter().any(|(e, _)| *e == email) {
+                                st.error = Some(format!("{email} is already added. Edit it in Settings › Accounts."));
+                                continue_email = false;
+                            } else {
+                                st.error = None;
+                                if !st.ed.username_touched {
+                                    st.ed.username = st.ed.email.trim().to_string();
                                 }
                             }
-                            ui.add_space(20.0);
-                            ui.horizontal(|ui| {
-                                ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
-                                    if kit::primary_button(ui, None, "Open inbox").clicked() {
-                                        close = true;
-                                    }
-                                    if kit::secondary_button(ui, "Add another").clicked() {
-                                        self.acts.push(Action::AddAccount);
-                                        close = true;
-                                    }
-                                });
-                            });
                         }
                     }
-                });
+                    SetupStep::SignIn => {
+                        kit::section_title(ui, "Sign in");
+                        ui.label(RichText::new(&st.ed.email).color(p.text));
+                        ui.label(RichText::new(&st.detected).size(ty::META).color(p.text_secondary));
+                        ui.add_space(12.0);
+                        Self::signin_controls(ui, &mut st.ed, &mut st.show_password, &settings, &tx);
+                        ui.add_space(12.0);
+                        ui.label(RichText::new("Your name (shown to people you email)").color(p.text_secondary));
+                        ui.add(kit::text_field(&mut st.ed.name, "Optional").desired_width(f32::INFINITY));
+                        if let Some(e) = &st.error {
+                            ui.add_space(8.0);
+                            kit::notice(ui, Tone::Error, e, None);
+                        }
+                        ui.add_space(20.0);
+                        ui.horizontal(|ui| {
+                            if ui.add(egui::Button::new(RichText::new("Server settings").color(p.accent)).frame(false)).clicked() {
+                                st.step = SetupStep::Manual;
+                            }
+                            ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                                let ready = match st.ed.auth {
+                                    AuthKind::Password => !st.ed.password.is_empty(),
+                                    _ => matches!(st.ed.oauth, OAuthState::Done(_)),
+                                };
+                                if ui.add_enabled_ui(ready, |ui| kit::primary_button(ui, None, "Continue")).inner.clicked()
+                                    || (submit && ready)
+                                {
+                                    verify = true;
+                                }
+                                if kit::secondary_button(ui, "Back").clicked() {
+                                    st.step = SetupStep::Email;
+                                }
+                            });
+                        });
+                    }
+                    SetupStep::Manual => {
+                        ui.horizontal(|ui| {
+                            ui.label(kit::glyph(ic::ICON_MAIL, 18.0, p.text_secondary));
+                            ui.label(RichText::new(st.ed.email.trim()).color(p.text));
+                            if ui.add(egui::Button::new(RichText::new("Change").color(p.accent)).frame(false)).clicked() {
+                                st.step = SetupStep::Email;
+                                st.error = None;
+                            }
+                        });
+                        ui.add_space(8.0);
+                        kit::section_title(ui, "Server settings");
+                        if !st.detected.is_empty() {
+                            ui.label(RichText::new(&st.detected).size(ty::META + 1.0).color(p.text_secondary));
+                            ui.add_space(8.0);
+                        }
+                        Self::server_form(ui, &mut st.ed);
+                        ui.add_space(12.0);
+                        Self::signin_controls(ui, &mut st.ed, &mut st.show_password, &settings, &tx);
+                        if let Some(e) = &st.error {
+                            ui.add_space(8.0);
+                            kit::notice(ui, Tone::Error, e, None);
+                        }
+                        ui.add_space(20.0);
+                        ui.horizontal(|ui| {
+                            ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                                let ok = !st.ed.imap.host.trim().is_empty() && !st.ed.smtp.host.trim().is_empty();
+                                if ui.add_enabled_ui(ok, |ui| kit::primary_button(ui, None, "Continue")).inner.clicked() || (submit && ok) {
+                                    verify = true;
+                                }
+                                if kit::secondary_button(ui, "Back").clicked() {
+                                    st.step = SetupStep::Email;
+                                }
+                            });
+                        });
+                    }
+                    SetupStep::Verify => {
+                        kit::section_title(ui, "Checking your account");
+                        let row = |ui: &mut egui::Ui, label: &str, check: &Check| {
+                            ui.horizontal(|ui| {
+                                match check {
+                                    Check::Running | Check::Waiting => {
+                                        ui.add(egui::Spinner::new().size(18.0).color(p.text_secondary));
+                                    }
+                                    Check::Ok => {
+                                        ui.label(kit::glyph(ic::ICON_CHECK_CIRCLE, 20.0, p.success));
+                                    }
+                                    Check::Failed(_) => {
+                                        ui.label(kit::glyph(ic::ICON_ERROR, 20.0, p.error));
+                                    }
+                                }
+                                ui.label(RichText::new(label).color(p.text));
+                            });
+                            if let Check::Failed(e) = check {
+                                ui.horizontal(|ui| {
+                                    ui.add_space(28.0);
+                                    ui.add(egui::Label::new(RichText::new(e).size(ty::META + 1.0).color(p.text_secondary)).wrap());
+                                });
+                            }
+                            ui.add_space(6.0);
+                        };
+                        ui.horizontal(|ui| {
+                            ui.label(kit::glyph(ic::ICON_CHECK_CIRCLE, 20.0, p.success));
+                            ui.label(RichText::new("Found settings").color(p.text));
+                        });
+                        ui.add_space(6.0);
+                        row(ui, "Signed in to incoming mail", &st.incoming);
+                        row(ui, "Signed in to outgoing mail", &st.outgoing);
+                        let failed = matches!(st.incoming, Check::Failed(_)) || matches!(st.outgoing, Check::Failed(_));
+                        if let Some(issue) = st.admin.as_ref().filter(|_| failed) {
+                            ui.add_space(8.0);
+                            admin_card(ui, issue);
+                        }
+                        if let Some(e) = &st.error {
+                            kit::notice(ui, Tone::Error, e, None);
+                        }
+                        ui.add_space(20.0);
+                        ui.horizontal(|ui| {
+                            if failed
+                                && ui.add(egui::Button::new(RichText::new("Edit server settings").color(p.accent)).frame(false)).clicked()
+                            {
+                                st.step = SetupStep::Manual;
+                            }
+                            ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                                if failed {
+                                    if kit::primary_button(ui, None, "Try again").clicked() {
+                                        verify = true;
+                                    }
+                                    if kit::secondary_button(ui, "Back").clicked() {
+                                        st.step = SetupStep::SignIn;
+                                    }
+                                } else if kit::secondary_button(ui, "Cancel").clicked() {
+                                    close = true;
+                                }
+                            });
+                        });
+                    }
+                    SetupStep::Done => {
+                        ui.horizontal(|ui| {
+                            ui.label(kit::glyph(ic::ICON_CHECK_CIRCLE, 28.0, p.success));
+                            ui.label(
+                                RichText::new(format!("{} is ready", st.ed.email.trim())).font(theme::semibold(ty::HEADING)).color(p.text),
+                            );
+                        });
+                        ui.add_space(4.0);
+                        ui.label(RichText::new("Your mail is syncing now.").color(p.text_secondary));
+                        ui.add_space(16.0);
+                        if let Some(i) = st.added {
+                            if let Some(a) = self.accts.get_mut(i) {
+                                ui.label(RichText::new("Signature (optional)").color(p.text_secondary));
+                                if ui
+                                    .add(
+                                        egui::TextEdit::multiline(&mut a.cfg.signature)
+                                            .desired_rows(3)
+                                            .desired_width(f32::INFINITY)
+                                            .margin(egui::Margin::same(8)),
+                                    )
+                                    .changed()
+                                {
+                                    self.cfg
+                                        .accounts
+                                        .iter_mut()
+                                        .filter(|x| x.id == a.cfg.id)
+                                        .for_each(|x| x.signature = a.cfg.signature.clone());
+                                }
+                                ui.add_space(8.0);
+                                let mut n = a.cfg.notify;
+                                if kit::switch_labeled(ui, &mut n, "Notify me about new mail") {
+                                    a.cfg.notify = n;
+                                    a.shared.notify.store(settings.notifications && n, Ordering::Relaxed);
+                                }
+                            }
+                        }
+                        ui.add_space(20.0);
+                        ui.horizontal(|ui| {
+                            ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                                if kit::primary_button(ui, None, "Open inbox").clicked() {
+                                    close = true;
+                                }
+                                if kit::secondary_button(ui, "Add another").clicked() {
+                                    self.acts.push(Action::AddAccount);
+                                    close = true;
+                                }
+                            });
+                        });
+                    }
+                };
+                if short {
+                    egui::ScrollArea::vertical()
+                        .id_salt("setup-scroll")
+                        .max_height(max_h)
+                        .auto_shrink([false, false])
+                        .show(ui, |ui| body(ui));
+                } else {
+                    body(ui);
+                }
             });
         if modal.should_close() && !matches!(self.setup.as_ref().map(|s| s.step), Some(SetupStep::Done)) {
             close = true;
@@ -5501,6 +5501,9 @@ impl eframe::App for App {
         static N: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
         let n = N.fetch_add(1, Ordering::Relaxed);
         if let Ok(i) = std::env::var("MAIL_DEMO_OPEN") {
+            if n == 2 && std::env::var("MAIL_DEMO_PANEL").is_ok_and(|v| v.starts_with("small")) {
+                ctx.send_viewport_cmd(egui::ViewportCommand::InnerSize(egui::vec2(760.0, 440.0)));
+            }
             if n == 8 {
                 if let Some(r) = self.rows.get(i.parse::<usize>().unwrap_or(0)) {
                     let k = r.key.clone();
@@ -5521,6 +5524,13 @@ impl eframe::App for App {
                         self.settings_page = SettingsPage::Privacy;
                     }
                     Ok("admin") => self.open_editor(Some(0)),
+                    Ok("small-compose") => {
+                        self.reply(false);
+                        if let Some(c) = self.composes.last_mut() {
+                            c.error = Some("permanent error (535): 5.7.139 Authentication unsuccessful, SmtpClientAuthentication is disabled for the Mailbox.".into());
+                        }
+                    }
+                    Ok("small-setup") => self.open_editor(None),
                     Ok("composes") => {
                         for _ in 0..4 {
                             let a = self.current_acct();
