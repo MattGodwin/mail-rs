@@ -51,6 +51,7 @@ pub struct View {
     /// The HTML references remote images/styles/fonts (blocked by default).
     pub remote_content: bool,
     /// Inline parts by Content-ID (lowercase, no angle brackets): (mime, part).
+    #[cfg_attr(not(any(windows, target_os = "macos")), allow(dead_code))]
     pub cids: HashMap<String, (String, PartId)>,
     pub attachments: Vec<Attachment>,
     /// A calendar invitation and its raw .ics data.

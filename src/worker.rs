@@ -209,6 +209,7 @@ pub enum Ev {
     },
     Update(crate::update::Msg),
     /// A link clicked in the HTML view.
+    #[cfg_attr(not(any(windows, target_os = "macos")), allow(dead_code))]
     Link(String),
     /// A decoded image-attachment preview for the reader.
     Preview {

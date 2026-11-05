@@ -12,6 +12,9 @@
 //! Only a display copy of the HTML is adjusted (meta refresh removed, `cid:`
 //! references pointed at the local scheme); the stored message is untouched.
 
+// Linux has no embedded web view; these helpers are only used where it exists.
+#![cfg_attr(not(any(windows, target_os = "macos")), allow(dead_code))]
+
 use std::collections::HashMap;
 use std::sync::OnceLock;
 
