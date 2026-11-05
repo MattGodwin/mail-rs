@@ -165,7 +165,7 @@ impl Config {
 pub fn new_account_id() -> String {
     let nanos = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map(|d| d.as_nanos()).unwrap_or(0);
     let mut r = [0u8; 4];
-    let _ = getrandom::getrandom(&mut r);
+    let _ = getrandom::fill(&mut r);
     format!("{:x}{:08x}", nanos, u32::from_le_bytes(r))
 }
 

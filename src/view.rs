@@ -4,14 +4,14 @@
 //! user saves, forwards or opens comes from those original bytes.
 
 use crate::model;
-use mail_parser::{Addr, Address, MessageParser, MimeHeaders, PartType};
+use mail_parser::{AddressList, Mailbox, MessageParser, PartId, PartKind};
 use std::sync::Arc;
 
 pub struct Attachment {
     pub name: String,
     pub mime: String,
     pub size: usize,
-    pub part: usize,
+    pub part: PartId,
 }
 
 /// A run of body text: plain text, or a line containing clickable links.
@@ -42,7 +42,7 @@ pub struct View {
     pub raw: Arc<Vec<u8>>,
 }
 
-pub fn fmt_addr(a: &Addr) -> String {
+pub fn fmt_addr(a: &Mailbox) -> String {
     let addr = a.address().unwrap_or("");
     match a.name() {
         Some(n) if !n.trim().is_empty() && n != addr => {
@@ -57,12 +57,8 @@ pub fn fmt_addr(a: &Addr) -> String {
     }
 }
 
-fn addr_list(a: Option<&Address>) -> Vec<String> {
-    a.map(|a| a.iter().filter(|x| x.address().is_some()).map(fmt_addr).collect()).unwrap_or_default()
-}
-
-fn id_list(v: &mail_parser::HeaderValue) -> Vec<String> {
-    v.as_text_list().unwrap_or_default().into_iter().map(|s| s.to_string()).collect()
+fn addr_list(a: Option<AddressList>) -> Vec<String> {
+    a.map(|a| a.mailboxes().filter(|x| x.address().is_some()).map(|m| fmt_addr(&m)).collect()).unwrap_or_default()
 }
 
 pub fn parse(raw: Arc<Vec<u8>>) -> View {
@@ -107,19 +103,18 @@ pub fn parse(raw: Arc<Vec<u8>>) -> View {
     // the HTML part. Nothing remote is ever fetched.
     let mut text = String::new();
     let mut has_plain = false;
-    for &id in &msg.text_body {
-        if let Some(PartType::Text(t)) = msg.part(id).map(|p| &p.body) {
-            if !text.is_empty() {
-                text.push_str("\n\n");
+    for p in msg.text_body() {
+        if matches!(p.kind(), PartKind::Text) {
+            if let Some(t) = p.text() {
+                if !text.is_empty() {
+                    text.push_str("\n\n");
+                }
+                text.push_str(&t);
+                has_plain = true;
             }
-            text.push_str(t);
-            has_plain = true;
         }
     }
-    let html = msg.html_body.iter().find_map(|&id| match msg.part(id).map(|p| &p.body) {
-        Some(PartType::Html(h)) => Some(h.to_string()),
-        _ => None,
-    });
+    let html = msg.html_body().find(|p| matches!(p.kind(), PartKind::Html)).and_then(|p| p.text()).map(|h| h.into_owned());
     let mut from_html = false;
     if !has_plain {
         if let Some(h) = &html {
@@ -134,10 +129,8 @@ pub fn parse(raw: Arc<Vec<u8>>) -> View {
     }
 
     let attachments = msg
-        .attachments
-        .iter()
-        .filter_map(|&id| {
-            let p = msg.part(id)?;
+        .attachments()
+        .map(|p| {
             let mime = p
                 .content_type()
                 .map(|ct| match ct.subtype() {
@@ -146,13 +139,11 @@ pub fn parse(raw: Arc<Vec<u8>>) -> View {
                 })
                 .unwrap_or_else(|| "application/octet-stream".into())
                 .to_ascii_lowercase();
-            let name = p.attachment_name().map(model::one_line).unwrap_or_else(|| match &p.body {
-                PartType::Message(m) => {
-                    format!("{}.eml", m.subject().map(sanitize_filename).unwrap_or_else(|| "message".into()))
-                }
-                _ => format!("attachment-{id}"),
+            let name = p.attachment_name().map(model::one_line).unwrap_or_else(|| match p.kind() {
+                PartKind::Message(m) => format!("{}.eml", m.subject().map(sanitize_filename).unwrap_or_else(|| "message".into())),
+                _ => format!("attachment-{}", p.id()),
             });
-            Some(Attachment { name, mime, size: p.contents().len(), part: id })
+            Attachment { name, mime, size: p.decoded_len(), part: p.id() }
         })
         .collect();
 
@@ -163,7 +154,7 @@ pub fn parse(raw: Arc<Vec<u8>>) -> View {
         cc: cc_list.join(", "),
         date: msg.date().map(|d| model::fmt_date_long(d.to_timestamp())).unwrap_or_default(),
         message_id: msg.message_id().unwrap_or("").to_string(),
-        references: id_list(msg.references()),
+        references: msg.references().map(|t| t.iter().map(String::from).collect()).unwrap_or_default(),
         reply_to,
         to_list,
         cc_list,
@@ -177,15 +168,11 @@ pub fn parse(raw: Arc<Vec<u8>>) -> View {
     }
 }
 
-/// The decoded bytes of one MIME part (for saving an attachment).
-pub fn part_bytes(raw: &[u8], part: usize) -> Option<Vec<u8>> {
+/// The decoded bytes of one MIME part (for saving an attachment). A nested
+/// message decodes to its original bytes.
+pub fn part_bytes(raw: &[u8], part: PartId) -> Option<Vec<u8>> {
     let msg = MessageParser::default().parse(raw)?;
-    let p = msg.part(part)?;
-    Some(match &p.body {
-        // A nested message is saved as its original bytes.
-        PartType::Message(m) => m.raw_message().to_vec(),
-        _ => p.contents().to_vec(),
-    })
+    Some(msg.part(part)?.decoded().into_owned())
 }
 
 /// (name, mime, bytes) of every attachment, for forwarding.

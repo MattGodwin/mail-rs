@@ -14,7 +14,7 @@ use crate::net::{self, ConnErr, Session};
 use crate::store::Store;
 use eframe::egui;
 use imap::types::{Fetch, Flag, NameAttribute, UnsolicitedResponse};
-use mail_parser::{MessageParser, MimeHeaders};
+use mail_parser::MessageParser;
 use std::collections::{HashMap, HashSet};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::mpsc::{Receiver, RecvTimeoutError, Sender, TryRecvError};
@@ -1126,11 +1126,11 @@ fn summarize(f: &Fetch) -> Option<Summary> {
         }
         s.to = m
             .to()
-            .map(|t| t.iter().map(|a| a.name().or(a.address()).unwrap_or("").to_string()).collect::<Vec<_>>().join(", "))
+            .map(|t| t.mailboxes().map(|a| a.name().or(a.address()).unwrap_or("").to_string()).collect::<Vec<_>>().join(", "))
             .unwrap_or_default();
         s.to = model::one_line(&s.to);
         s.message_id = m.message_id().unwrap_or("").to_string();
-        s.attach = m.root_part().content_type().is_some_and(|ct| {
+        s.attach = m.content_type().is_some_and(|ct| {
             ct.ctype().eq_ignore_ascii_case("multipart") && ct.subtype().is_some_and(|st| st.eq_ignore_ascii_case("mixed"))
         });
         header_date = m.date().map(|d| d.to_timestamp());

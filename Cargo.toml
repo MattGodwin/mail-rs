@@ -8,12 +8,12 @@ readme = "README.md"
 license = "MIT"
 
 [dependencies]
-eframe = "0.31"
+eframe = "0.37"
 imap = "2.4"
 native-tls = "0.2"
 lettre = { version = "0.11", default-features = false, features = ["smtp-transport", "native-tls", "builder", "hostname"] }
-mail-parser = "0.9"
-keyring = { version = "3", features = ["windows-native", "apple-native", "linux-native"] }
+mail-parser = "1"
+keyring = "4"
 rfd = "0.17"
 directories = "6"
 serde = { version = "1", features = ["derive"] }
@@ -25,9 +25,8 @@ open = "5"
 chrono = "0.4"
 mime_guess = "2"
 sha2 = "0.11"
-base64 = "0.22"
-getrandom = "0.2"
-anyhow = "1"
+base64 = "0.23"
+getrandom = "0.4"
 notify-rust = "4"
 semver = "1"
 

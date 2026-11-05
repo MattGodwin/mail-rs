@@ -68,7 +68,7 @@ fn now_ms() -> u64 {
 
 fn jitter(d: Duration) -> Duration {
     let mut b = [0u8; 2];
-    let _ = getrandom::getrandom(&mut b);
+    let _ = getrandom::fill(&mut b);
     let f = 0.8 + (u16::from_le_bytes(b) as f64 / u16::MAX as f64) * 0.4;
     d.mul_f64(f)
 }

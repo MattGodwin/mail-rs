@@ -392,7 +392,7 @@ pub fn icon() -> egui::IconData {
 fn one_line_galley(ui: &egui::Ui, text: String, font: FontId, color: Color32, max_width: f32) -> Arc<Galley> {
     let mut job = LayoutJob::single_section(text, TextFormat::simple(font, color));
     job.wrap = TextWrapping { max_width, max_rows: 1, break_anywhere: true, overflow_character: Some('…') };
-    ui.fonts(|f| f.layout_job(job))
+    ui.painter().layout_job(job)
 }
 
 fn ago(t: SystemTime) -> String {
@@ -419,7 +419,7 @@ fn paint_row(ui: &mut egui::Ui, r: &Row, selected: bool, stripe: Option<Color32>
         model::fmt_date_long(r.s.date),
         if acct_label.is_empty() { String::new() } else { format!(", {acct_label}") }
     );
-    resp.widget_info(|| egui::WidgetInfo::selected(egui::WidgetType::SelectableLabel, true, selected, &label));
+    resp.widget_info(|| egui::WidgetInfo::selected(egui::Role::ListBoxOption, true, selected, &label));
     if !ui.is_rect_visible(rect) {
         return resp;
     }
@@ -479,7 +479,7 @@ fn paint_row(ui: &mut egui::Ui, r: &Row, selected: bool, stripe: Option<Color32>
 }
 
 fn compose_layer(id: u64) -> egui::LayerId {
-    egui::LayerId::new(Order::Middle, Id::new(("compose", id)))
+    egui::LayerId::new(Order::Middle, Id::unique(("compose", id)))
 }
 
 fn smtp_hint(e: &str) -> String {
@@ -1813,12 +1813,13 @@ impl App {
         }
     }
 
-    fn ui_update_banner(&mut self, ctx: &egui::Context) {
+    fn ui_update_banner(&mut self, root: &mut egui::Ui) {
+        let ctx = &root.ctx().clone();
         let Some(s) = &self.staged else { return };
         let (version, url, mode) = (s.version.to_string(), s.url.clone(), s.mode);
-        egui::TopBottomPanel::top("update-banner")
-            .frame(egui::Frame::side_top_panel(&ctx.style()).inner_margin(egui::Margin::symmetric(12, 5)))
-            .show(ctx, |ui| {
+        egui::Panel::top("update-banner")
+            .frame(egui::Frame::side_top_panel(&ctx.global_style()).inner_margin(egui::Margin::symmetric(12, 5)))
+            .show(root, |ui| {
                 ui.horizontal(|ui| {
                     ui.label(RichText::new("✨").color(ACCENT));
                     let text = match mode {
@@ -2084,10 +2085,11 @@ impl App {
 
     // -------------------------------------------------------------- UI ---
 
-    fn ui_top(&mut self, ctx: &egui::Context) {
-        egui::TopBottomPanel::top("top")
-            .frame(egui::Frame::side_top_panel(&ctx.style()).inner_margin(egui::Margin::symmetric(10, 7)))
-            .show(ctx, |ui| {
+    fn ui_top(&mut self, root: &mut egui::Ui) {
+        let ctx = &root.ctx().clone();
+        egui::Panel::top("top").frame(egui::Frame::side_top_panel(&ctx.global_style()).inner_margin(egui::Margin::symmetric(10, 7))).show(
+            root,
+            |ui| {
                 ui.horizontal(|ui| {
                     if ui
                         .add(egui::Button::new(RichText::new("✏  Compose").color(Color32::WHITE)).fill(ACCENT))
@@ -2140,13 +2142,15 @@ impl App {
                         }
                     });
                 });
-            });
+            },
+        );
     }
 
-    fn ui_status(&mut self, ctx: &egui::Context) {
-        egui::TopBottomPanel::bottom("status")
-            .frame(egui::Frame::side_top_panel(&ctx.style()).inner_margin(egui::Margin::symmetric(10, 3)))
-            .show(ctx, |ui| {
+    fn ui_status(&mut self, root: &mut egui::Ui) {
+        let ctx = &root.ctx().clone();
+        egui::Panel::bottom("status")
+            .frame(egui::Frame::side_top_panel(&ctx.global_style()).inner_margin(egui::Margin::symmetric(10, 3)))
+            .show(root, |ui| {
                 ui.horizontal(|ui| {
                     let text = if self.status.is_empty() { "Ready".to_string() } else { self.status.clone() };
                     ui.add(egui::Label::new(RichText::new(text).small().weak()).truncate());
@@ -2158,7 +2162,7 @@ impl App {
         let Some(p) = self.pending.last() else { return };
         let label = p.label.clone();
         let left = p.deadline.saturating_duration_since(Instant::now()).as_secs() + 1;
-        egui::Area::new(Id::new("undo-toast")).order(Order::Foreground).anchor(Align2::CENTER_BOTTOM, egui::vec2(0.0, -34.0)).show(
+        egui::Area::new(Id::unique("undo-toast")).order(Order::Foreground).anchor(Align2::CENTER_BOTTOM, egui::vec2(0.0, -34.0)).show(
             ctx,
             |ui| {
                 egui::Frame::popup(ui.style()).show(ui, |ui| {
@@ -2215,8 +2219,8 @@ impl App {
         });
     }
 
-    fn ui_folders(&mut self, ctx: &egui::Context) {
-        egui::SidePanel::left("folders").resizable(true).default_width(220.0).width_range(160.0..=360.0).show(ctx, |ui| {
+    fn ui_folders(&mut self, root: &mut egui::Ui) {
+        egui::Panel::left("folders").resizable(true).default_size(220.0).size_range(160.0..=360.0).show(root, |ui| {
             egui::ScrollArea::vertical().auto_shrink([false, false]).show(ui, |ui| {
                 ui.add_space(6.0);
                 ui.with_layout(Layout::top_down_justified(Align::LEFT), |ui| {
@@ -2272,15 +2276,15 @@ impl App {
                         head.header_response.context_menu(|ui| {
                             if ui.button("Edit account…").clicked() {
                                 acts.push(Action::EditAccount(i));
-                                ui.close_menu();
+                                ui.close();
                             }
                             if ui.button(if paused { "Resume" } else { "Pause" }).clicked() {
                                 acts.push(Action::Pause(i, !paused));
-                                ui.close_menu();
+                                ui.close();
                             }
                             if ui.button("Remove account…").clicked() {
                                 acts.push(Action::RemoveAccount(i));
-                                ui.close_menu();
+                                ui.close();
                             }
                         });
                     }
@@ -2290,13 +2294,14 @@ impl App {
         });
     }
 
-    fn ui_list(&mut self, ctx: &egui::Context) {
-        egui::SidePanel::left("list")
+    fn ui_list(&mut self, root: &mut egui::Ui) {
+        let ctx = &root.ctx().clone();
+        egui::Panel::left("list")
             .resizable(true)
-            .default_width(380.0)
-            .width_range(260.0..=700.0)
-            .frame(egui::Frame::side_top_panel(&ctx.style()).inner_margin(egui::Margin::symmetric(0, 6)))
-            .show(ctx, |ui| {
+            .default_size(380.0)
+            .size_range(260.0..=700.0)
+            .frame(egui::Frame::side_top_panel(&ctx.global_style()).inner_margin(egui::Margin::symmetric(0, 6)))
+            .show(root, |ui| {
                 ui.horizontal(|ui| {
                     ui.add_space(12.0);
                     let (title, more) = match &self.sel {
@@ -2403,26 +2408,26 @@ impl App {
                             let keys = vec![key.clone()];
                             if ui.button(if seen { "Mark as unread" } else { "Mark as read" }).clicked() {
                                 acts.push(Action::Flag(keys.clone(), MsgFlag::Seen, !seen));
-                                ui.close_menu();
+                                ui.close();
                             }
                             if ui.button(if flagged { "Unstar" } else { "Star" }).clicked() {
                                 acts.push(Action::Flag(keys.clone(), MsgFlag::Flagged, !flagged));
-                                ui.close_menu();
+                                ui.close();
                             }
                             if ui.button("Archive").clicked() {
                                 acts.push(Action::Archive(keys.clone()));
-                                ui.close_menu();
+                                ui.close();
                             }
                             if ui.button("Delete").clicked() {
                                 acts.push(Action::Trash(keys.clone()));
-                                ui.close_menu();
+                                ui.close();
                             }
                             ui.menu_button("Move to", |ui| {
                                 egui::ScrollArea::vertical().max_height(360.0).show(ui, |ui| {
                                     for f in a.folders.iter().filter(|f| f.selectable && f.name != key.folder) {
                                         if ui.button(&f.display).clicked() {
                                             acts.push(Action::MoveTo(keys.clone(), f.name.clone()));
-                                            ui.close_menu();
+                                            ui.close();
                                         }
                                     }
                                 });
@@ -2431,14 +2436,15 @@ impl App {
                     }
                 });
                 self.acts.extend(acts);
-                self.list_scroll = (out.state.offset.y, out.inner_rect.height());
+                self.list_scroll = (out.state.clamped_offset().y, out.inner_rect.height());
             });
     }
 
-    fn ui_reader(&mut self, ctx: &egui::Context) {
-        egui::CentralPanel::default().frame(egui::Frame::central_panel(&ctx.style()).inner_margin(egui::Margin::symmetric(20, 12))).show(
-            ctx,
-            |ui| {
+    fn ui_reader(&mut self, root: &mut egui::Ui) {
+        let ctx = &root.ctx().clone();
+        egui::CentralPanel::default()
+            .frame(egui::Frame::central_panel(&ctx.global_style()).inner_margin(egui::Margin::symmetric(20, 12)))
+            .show(root, |ui| {
                 if self.live_count() == 0 {
                     ui.vertical_centered(|ui| {
                         ui.add_space(ui.available_height() * 0.3);
@@ -2506,11 +2512,11 @@ impl App {
                     ui.menu_button("⋯", |ui| {
                         if ui.button("View source").clicked() {
                             self.acts.push(Action::ViewSource);
-                            ui.close_menu();
+                            ui.close();
                         }
                         if ui.button("Save as .eml (original bytes)").clicked() {
                             self.acts.push(Action::SaveEml);
-                            ui.close_menu();
+                            ui.close();
                         }
                         if v.html.is_some()
                             && ui
@@ -2519,11 +2525,11 @@ impl App {
                                 .clicked()
                         {
                             self.acts.push(Action::OpenHtml);
-                            ui.close_menu();
+                            ui.close();
                         }
                         if ui.button("Edit as new message").clicked() {
                             self.acts.push(Action::EditAsNew(false));
-                            ui.close_menu();
+                            ui.close();
                         }
                         ui.checkbox(&mut self.mono, "Monospace body");
                     });
@@ -2569,11 +2575,11 @@ impl App {
                                     r.context_menu(|ui| {
                                         if ui.button("Open").clicked() {
                                             self.acts.push(Action::OpenAttachment(i));
-                                            ui.close_menu();
+                                            ui.close();
                                         }
                                         if ui.button("Save as…").clicked() {
                                             self.acts.push(Action::SaveAttachment(i));
-                                            ui.close_menu();
+                                            ui.close();
                                         }
                                     });
                                 }
@@ -2622,8 +2628,7 @@ impl App {
                     }
                     ui.add_space(24.0);
                 });
-            },
-        );
+            });
     }
 
     /// Which compose window holds keyboard focus, if any.
@@ -2647,7 +2652,7 @@ impl App {
             .filter(|(_, a)| a.live())
             .map(|(i, a)| (i, a.cfg.label().to_string(), a.cfg.identities()))
             .collect();
-        let dropped: Vec<PathBuf> = ctx.input(|i| i.raw.dropped_files.iter().filter_map(|f| f.path.clone()).collect());
+        let dropped: Vec<PathBuf> = ctx.input(|i| i.raw.dropped_files.iter().map(|f| f.path().to_path_buf()).collect());
         let hovered_drop = ctx.input(|i| i.pointer.hover_pos());
         let mut acts = Vec::new();
         let mut drop_target: Option<u64> = None;
@@ -2656,7 +2661,7 @@ impl App {
             let id = c.id;
             let locked = c.sending || c.saving.is_some();
             let resp = egui::Window::new(c.title())
-                .id(Id::new(("compose", id)))
+                .id(Id::unique(("compose", id)))
                 .open(&mut open)
                 .default_size([640.0, 520.0])
                 .min_width(420.0)
@@ -2830,14 +2835,14 @@ impl App {
         let mut cancel = false;
         let title = if ed.editing.is_some() { "Edit account" } else { "Add account" };
         egui::Window::new(title)
-            .id(Id::new("account-editor"))
+            .id(Id::unique("account-editor"))
             .open(&mut open)
             .collapsible(false)
             .resizable(false)
             .default_width(500.0)
             .anchor(Align2::CENTER_CENTER, Vec2::ZERO)
             .show(ctx, |ui| {
-                egui::ScrollArea::vertical().max_height(ctx.screen_rect().height() - 140.0).show(ui, |ui| {
+                egui::ScrollArea::vertical().max_height(ctx.content_rect().height() - 140.0).show(ui, |ui| {
                     egui::Grid::new("acct-grid").num_columns(2).spacing([10.0, 8.0]).show(ui, |ui| {
                         ui.label("Provider");
                         let mut p = ed.provider;
@@ -3136,7 +3141,7 @@ impl App {
     fn ui_dialogs(&mut self, ctx: &egui::Context) {
         if let Some((title, src)) = &self.source {
             let mut open = true;
-            egui::Window::new(format!("Source — {title}")).id(Id::new("source")).open(&mut open).default_size([760.0, 560.0]).show(
+            egui::Window::new(format!("Source — {title}")).id(Id::unique("source")).open(&mut open).default_size([760.0, 560.0]).show(
                 ctx,
                 |ui| {
                     egui::ScrollArea::both().auto_shrink([false, false]).show(ui, |ui| {
@@ -3150,7 +3155,7 @@ impl App {
         }
         if self.shortcuts_open {
             let mut open = true;
-            egui::Window::new("Keyboard shortcuts").id(Id::new("shortcuts")).open(&mut open).collapsible(false).resizable(false).show(
+            egui::Window::new("Keyboard shortcuts").id(Id::unique("shortcuts")).open(&mut open).collapsible(false).resizable(false).show(
                 ctx,
                 |ui| {
                     egui::Grid::new("sc").num_columns(2).spacing([16.0, 4.0]).show(ui, |ui| {
@@ -3267,7 +3272,7 @@ impl App {
     }
 
     fn shortcuts(&mut self, ctx: &egui::Context) {
-        if ctx.wants_keyboard_input() || self.confirm.is_some() || self.editor.is_some() || self.quitting {
+        if ctx.text_edit_focused() || self.confirm.is_some() || self.editor.is_some() || self.quitting {
             return;
         }
         // Keys belong to whatever window has focus, never to the inbox behind it.
@@ -3368,7 +3373,7 @@ impl App {
 }
 
 impl eframe::App for App {
-    fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
+    fn logic(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
         let focused = ctx.input(|i| i.viewport().focused.unwrap_or(true));
         self.focused.store(focused, Ordering::Relaxed);
         self.handle_events();
@@ -3377,21 +3382,24 @@ impl eframe::App for App {
             self.rebuild_rows();
         }
         self.update_title();
+    }
 
-        self.ui_top(ctx);
-        self.ui_update_banner(ctx);
-        self.ui_status(ctx);
-        self.ui_folders(ctx);
-        self.ui_list(ctx);
-        self.ui_reader(ctx);
-        self.ui_composes(ctx);
-        self.ui_editor(ctx);
-        self.ui_settings(ctx);
-        self.ui_dialogs(ctx);
-        self.ui_toast(ctx);
-        self.shortcuts(ctx);
+    fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
+        let ctx = ui.ctx().clone();
+        self.ui_top(ui);
+        self.ui_update_banner(ui);
+        self.ui_status(ui);
+        self.ui_folders(ui);
+        self.ui_list(ui);
+        self.ui_reader(ui);
+        self.ui_composes(&ctx);
+        self.ui_editor(&ctx);
+        self.ui_settings(&ctx);
+        self.ui_dialogs(&ctx);
+        self.ui_toast(&ctx);
+        self.shortcuts(&ctx);
         self.autosave();
-        self.guard_exit(ctx);
+        self.guard_exit(&ctx);
 
         let acts = std::mem::take(&mut self.acts);
         if !acts.is_empty() {

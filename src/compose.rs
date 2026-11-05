@@ -52,7 +52,7 @@ pub struct Compose {
 
 pub fn new_key() -> String {
     let mut b = [0u8; 9];
-    let _ = getrandom::getrandom(&mut b);
+    let _ = getrandom::fill(&mut b);
     b.iter().map(|x| format!("{x:02x}")).collect()
 }
 

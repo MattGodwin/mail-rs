@@ -101,7 +101,7 @@ fn b64url(data: &[u8]) -> String {
 
 fn random_token() -> String {
     let mut b = [0u8; 32];
-    getrandom::getrandom(&mut b).expect("OS random source unavailable");
+    getrandom::fill(&mut b).expect("OS random source unavailable");
     b64url(&b)
 }
 
