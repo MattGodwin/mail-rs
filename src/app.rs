@@ -7,6 +7,7 @@ use crate::config::{Account, AuthKind, Config, Provider, Security, Server};
 use crate::drafts;
 use crate::model::{self, FolderIndex, FolderInfo, MsgFlag, Special, Summary};
 use crate::store::Store;
+use crate::update::{self, Staged};
 use crate::view::{self, Block, View};
 use crate::watcher::{self, Watcher};
 use crate::worker::{self, AcctState, Cmd, Ev, Event, OpErr, OpId, Shared};
@@ -160,6 +161,16 @@ impl Acct {
     }
 }
 
+enum UpdateState {
+    Idle,
+    Checking,
+    UpToDate,
+    Available(update::Release),
+    Downloading(String),
+    Ready,
+    Failed(String),
+}
+
 enum OAuthState {
     Idle,
     Waiting,
@@ -288,13 +299,21 @@ pub struct App {
     bold: bool,
     quitting: bool,
     force_quit: bool,
+    update: UpdateState,
+    staged: Option<Staged>,
+    started: Instant,
+    last_update_check: Option<Instant>,
+    restart_requested: bool,
     acts: Vec<Action>,
 }
 
 // ---------------------------------------------------------------- setup ---
 
 fn setup_style(ctx: &egui::Context) -> bool {
+    // Only Windows adds system fonts; elsewhere the defaults are used as-is.
+    #[cfg_attr(not(windows), allow(unused_mut))]
     let mut fonts = egui::FontDefinitions::default();
+    #[cfg_attr(not(windows), allow(unused_mut))]
     let mut bold = false;
     #[cfg(windows)]
     {
@@ -520,6 +539,11 @@ impl App {
             bold,
             quitting: false,
             force_quit: false,
+            update: UpdateState::Idle,
+            staged: None,
+            started: Instant::now(),
+            last_update_check: None,
+            restart_requested: false,
             acts: Vec::new(),
         };
         for (i, a) in cfg.accounts.into_iter().enumerate() {
@@ -687,6 +711,19 @@ impl App {
                     self.sent(compose, result);
                     continue;
                 }
+                Ev::Update(msg) => {
+                    self.update = match msg {
+                        update::Msg::UpToDate => UpdateState::UpToDate,
+                        update::Msg::Available(r) => UpdateState::Available(r),
+                        update::Msg::Downloading(v) => UpdateState::Downloading(v.to_string()),
+                        update::Msg::Ready(s) => {
+                            self.staged = Some(s);
+                            UpdateState::Ready
+                        }
+                        update::Msg::Failed(e) => UpdateState::Failed(e),
+                    };
+                    continue;
+                }
                 Ev::OAuth { editor, result } => {
                     if let Some(ed) = self.editor.as_mut().filter(|e| e.id == editor) {
                         ed.oauth = match result {
@@ -776,7 +813,7 @@ impl App {
                     self.open(key);
                     self.scroll_to_cur = true;
                 }
-                Ev::Done { .. } | Ev::Sent { .. } | Ev::OAuth { .. } => {}
+                Ev::Done { .. } | Ev::Sent { .. } | Ev::OAuth { .. } | Ev::Update(_) => {}
             }
         }
     }
@@ -1009,6 +1046,16 @@ impl App {
             }
         }
         self.was_focused = focused;
+        // Updates: first check shortly after launch, then daily.
+        if self.cfg.settings.auto_update && update::platform().is_some() && self.staged.is_none() {
+            let due = match self.last_update_check {
+                None => self.started.elapsed() >= Duration::from_secs(10),
+                Some(t) => t.elapsed() >= Duration::from_secs(24 * 3600),
+            };
+            if due && !matches!(self.update, UpdateState::Checking | UpdateState::Downloading(_)) {
+                self.check_updates(true);
+            }
+        }
         // Undo windows that have expired go to the server now.
         let now = Instant::now();
         let (due, keep): (Vec<Pending>, Vec<Pending>) = std::mem::take(&mut self.pending).into_iter().partition(|p| p.deadline <= now);
@@ -1718,6 +1765,75 @@ impl App {
     /// Anything that must finish before the app can safely exit.
     fn outstanding(&self) -> usize {
         self.composes.iter().filter(|c| c.sending || c.saving.is_some()).count() + self.pending.len() + self.ops.len()
+    }
+
+    fn check_updates(&mut self, install: bool) {
+        self.last_update_check = Some(Instant::now());
+        self.update = UpdateState::Checking;
+        let (tx, ctx) = (self.tx.clone(), self.ctx.clone());
+        update::spawn(install, move |msg| {
+            let _ = tx.send(Event { acct: String::new(), gen: 0, kind: Ev::Update(msg) });
+            ctx.request_repaint();
+        });
+    }
+
+    fn install_update(&mut self, r: update::Release) {
+        self.update = UpdateState::Downloading(r.version.to_string());
+        let (tx, ctx) = (self.tx.clone(), self.ctx.clone());
+        std::thread::spawn(move || {
+            let msg = match update::download(&r) {
+                Ok(s) => match s.mode {
+                    update::Mode::Portable => match update::apply_portable(&s) {
+                        Ok(()) => update::Msg::Ready(s),
+                        Err(e) => update::Msg::Failed(e),
+                    },
+                    update::Mode::Installer => update::Msg::Ready(s),
+                },
+                Err(e) => update::Msg::Failed(e),
+            };
+            let _ = tx.send(Event { acct: String::new(), gen: 0, kind: Ev::Update(msg) });
+            ctx.request_repaint();
+        });
+    }
+
+    /// Called once the window is really closing: finish a staged update.
+    fn on_closing(&mut self) {
+        if let Some(s) = self.staged.take() {
+            let r = match s.mode {
+                update::Mode::Installer => update::run_installer(&s, self.restart_requested),
+                update::Mode::Portable if self.restart_requested => update::relaunch(),
+                update::Mode::Portable => Ok(()),
+            };
+            if let Err(e) = r {
+                eprintln!("update: {e}");
+            }
+        } else if self.restart_requested {
+            let _ = update::relaunch();
+        }
+    }
+
+    fn ui_update_banner(&mut self, ctx: &egui::Context) {
+        let Some(s) = &self.staged else { return };
+        let (version, url, mode) = (s.version.to_string(), s.url.clone(), s.mode);
+        egui::TopBottomPanel::top("update-banner")
+            .frame(egui::Frame::side_top_panel(&ctx.style()).inner_margin(egui::Margin::symmetric(12, 5)))
+            .show(ctx, |ui| {
+                ui.horizontal(|ui| {
+                    ui.label(RichText::new("✨").color(ACCENT));
+                    let text = match mode {
+                        update::Mode::Installer => {
+                            format!("Mail {version} is ready to install. It installs automatically when you close Mail.")
+                        }
+                        update::Mode::Portable => format!("Mail {version} has been downloaded. It starts the next time you open Mail."),
+                    };
+                    ui.label(text);
+                    if ui.add(egui::Button::new(RichText::new("Restart now").color(Color32::WHITE)).fill(ACCENT)).clicked() {
+                        self.restart_requested = true;
+                        ctx.send_viewport_cmd(egui::ViewportCommand::Close);
+                    }
+                    ui.hyperlink_to("What's new", url);
+                });
+            });
     }
 
     fn apply(&mut self, act: Action) {
@@ -2909,6 +3025,8 @@ impl App {
         }
         let mut open = true;
         let mut changed = false;
+        let mut update_now = false;
+        let mut install: Option<update::Release> = None;
         let accts: Vec<(String, String)> =
             self.accts.iter().filter(|a| a.live()).map(|a| (a.cfg.id.clone(), a.cfg.label().to_string())).collect();
         egui::Window::new("Settings").open(&mut open).collapsible(false).resizable(false).default_width(460.0).show(ctx, |ui| {
@@ -2959,8 +3077,52 @@ impl App {
                 ui.end_row();
             });
             ui.add_space(6.0);
+            ui.label(RichText::new("Updates").strong());
+            ui.horizontal_wrapped(|ui| {
+                ui.label(format!("Version {}", update::current()));
+                changed |= ui.checkbox(&mut s.auto_update, "Install updates automatically").changed();
+            });
+            ui.horizontal_wrapped(|ui| {
+                let busy = matches!(self.update, UpdateState::Checking | UpdateState::Downloading(_));
+                if ui.add_enabled(!busy && self.staged.is_none() && update::platform().is_some(), egui::Button::new("Check now")).clicked() {
+                    update_now = true;
+                }
+                match &self.update {
+                    UpdateState::Idle => {}
+                    UpdateState::Checking => {
+                        ui.spinner();
+                        ui.label(RichText::new("Checking…").weak());
+                    }
+                    UpdateState::UpToDate => {
+                        ui.label(RichText::new("✔ You're up to date").color(GOOD));
+                    }
+                    UpdateState::Available(r) => {
+                        if ui.button(format!("Install {}", r.version)).clicked() {
+                            install = Some(r.clone());
+                        }
+                    }
+                    UpdateState::Downloading(v) => {
+                        ui.spinner();
+                        ui.label(RichText::new(format!("Downloading {v}…")).weak());
+                    }
+                    UpdateState::Ready => {
+                        ui.label(RichText::new("✔ Update ready: restart Mail to finish").color(GOOD));
+                    }
+                    UpdateState::Failed(e) => {
+                        ui.add(egui::Label::new(RichText::new(format!("Update failed: {e}")).small().color(ui.visuals().warn_fg_color)).wrap());
+                    }
+                }
+            });
+            ui.add_space(6.0);
             ui.label(RichText::new(format!("Data: {}", crate::config::cache_dir().display())).small().weak());
         });
+        if update_now {
+            let auto = self.cfg.settings.auto_update;
+            self.check_updates(auto);
+        }
+        if let Some(r) = install {
+            self.install_update(r);
+        }
         if changed {
             self.sync_shared();
             if let Err(e) = self.cfg.save() {
@@ -3189,6 +3351,8 @@ impl App {
             if self.outstanding() > 0 && !self.force_quit {
                 ctx.send_viewport_cmd(egui::ViewportCommand::CancelClose);
                 self.quitting = true;
+            } else {
+                self.on_closing();
             }
         }
         if self.quitting {
@@ -3214,6 +3378,7 @@ impl eframe::App for App {
         self.update_title();
 
         self.ui_top(ctx);
+        self.ui_update_banner(ctx);
         self.ui_status(ctx);
         self.ui_folders(ctx);
         self.ui_list(ctx);

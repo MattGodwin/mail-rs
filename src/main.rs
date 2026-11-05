@@ -12,11 +12,13 @@ mod oauth;
 mod secrets;
 mod smtp;
 mod store;
+mod update;
 mod view;
 mod watcher;
 mod worker;
 
 fn main() -> eframe::Result {
+    update::cleanup();
     let options = eframe::NativeOptions {
         viewport: eframe::egui::ViewportBuilder::default()
             .with_title("Mail")

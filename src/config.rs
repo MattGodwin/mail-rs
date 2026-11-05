@@ -106,6 +106,8 @@ pub struct Settings {
     pub notify_preview: bool,
     /// Account id used for new messages from the unified view.
     pub default_account: String,
+    /// Download and install new releases automatically.
+    pub auto_update: bool,
 }
 
 impl Default for Settings {
@@ -120,6 +122,7 @@ impl Default for Settings {
             notifications: true,
             notify_preview: true,
             default_account: String::new(),
+            auto_update: true,
         }
     }
 }

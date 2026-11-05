@@ -1,7 +1,12 @@
 name: Release
 
-# Push a tag like v0.2.0 (matching the version in Cargo.toml) to build
-# binaries for every platform and publish them as a GitHub Release.
+# Push a tag like v0.2.0 (matching the version in Cargo.toml) to build every
+# platform, the Windows installer, and publish a GitHub Release. The in-app
+# updater downloads the assets below by name, so keep the names stable:
+#   mail-rs-setup-windows-x64.exe          Windows installer
+#   mail-rs-<platform>[.exe]               plain executables (portable / updater)
+#   mail-rs-<tag>-<platform>.zip|.tar.gz   archives for manual download
+#   SHA256SUMS.txt                         checksums (required by the updater)
 on:
   push:
     tags: ["v*.*.*"]
@@ -23,7 +28,7 @@ jobs:
     name: Check tag matches Cargo.toml
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
         with:
           ref: ${{ env.TAG }}
       - name: Compare versions
@@ -46,21 +51,21 @@ jobs:
           - name: windows-x64
             os: windows-latest
             target: x86_64-pc-windows-msvc
-            bin: mail-rs.exe
+            exe: .exe
           - name: linux-x64
             os: ubuntu-22.04
             target: x86_64-unknown-linux-gnu
-            bin: mail-rs
+            exe: ""
           - name: macos-arm64
             os: macos-latest
             target: aarch64-apple-darwin
-            bin: mail-rs
+            exe: ""
           - name: macos-x64
             os: macos-latest
             target: x86_64-apple-darwin
-            bin: mail-rs
+            exe: ""
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
         with:
           ref: ${{ env.TAG }}
       - uses: dtolnay/rust-toolchain@stable
@@ -82,9 +87,11 @@ jobs:
       - name: Package
         shell: bash
         run: |
+          bin="target/${{ matrix.target }}/release/mail-rs${{ matrix.exe }}"
           name="mail-rs-${TAG}-${{ matrix.name }}"
           mkdir -p "dist/${name}"
-          cp "target/${{ matrix.target }}/release/${{ matrix.bin }}" README.md LICENSE "dist/${name}/"
+          cp "$bin" "dist/mail-rs-${{ matrix.name }}${{ matrix.exe }}"
+          cp "$bin" README.md LICENSE "dist/${name}/"
           cd dist
           if [ "${{ runner.os }}" = "Windows" ]; then
             7z a -tzip "${name}.zip" "${name}" > /dev/null
@@ -92,7 +99,19 @@ jobs:
             tar -czf "${name}.tar.gz" "${name}"
           fi
           rm -rf "${name}"
-      - uses: actions/upload-artifact@v4
+      - name: Build Windows installer
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          choco install innosetup --no-progress -y
+          $iscc = "${env:ProgramFiles(x86)}\Inno Setup 6\ISCC.exe"
+          $version = "${env:TAG}".TrimStart('v')
+          $exe = Resolve-Path "target\${{ matrix.target }}\release\mail-rs.exe"
+          $out = Resolve-Path dist
+          & $iscc /Q "/DAppVersion=$version" "/DSourceExe=$exe" "/DOutputDir=$out" installer\mail.iss
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          Get-ChildItem dist
+      - uses: actions/upload-artifact@v7
         with:
           name: ${{ matrix.name }}
           path: dist/*
@@ -103,7 +122,7 @@ jobs:
     needs: build
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/download-artifact@v4
+      - uses: actions/download-artifact@v8
         with:
           path: dist
           merge-multiple: true
@@ -112,7 +131,7 @@ jobs:
           cd dist
           sha256sum * > SHA256SUMS.txt
           cat SHA256SUMS.txt
-      - uses: softprops/action-gh-release@v2
+      - uses: softprops/action-gh-release@v3
         with:
           tag_name: ${{ env.TAG }}
           name: Mail ${{ env.TAG }}

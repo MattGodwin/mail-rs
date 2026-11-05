@@ -29,6 +29,10 @@ base64 = "0.22"
 getrandom = "0.2"
 anyhow = "1"
 notify-rust = "4"
+semver = "1"
+
+[build-dependencies]
+winresource = "0.1"
 
 [profile.release]
 opt-level = 3

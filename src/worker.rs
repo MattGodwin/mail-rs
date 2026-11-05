@@ -207,6 +207,7 @@ pub enum Ev {
         folder: String,
         uid: u32,
     },
+    Update(crate::update::Msg),
 }
 
 pub struct Event {
