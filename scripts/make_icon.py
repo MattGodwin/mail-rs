@@ -1,48 +1,64 @@
-"""Generate assets/icon.ico (16-256 px) from the app's envelope design.
-
-Pure standard library: draws each size with supersampling, encodes PNG,
-and packs the PNGs into a multi-resolution ICO. Run: python scripts/make_icon.py
+"""Generate assets/icon.ico (16-256 px) and assets/icon.svg from the app icon
+geometry (mirrors src/appicon.rs): a navy tile, a white envelope with a navy
+flap seam, and a light-blue folded corner. Small sizes drop the fold and
+thicken the seam. Standard library only. Run: python scripts/make_icon.py
 """
+import math
 import os
 import struct
 import zlib
 
-BG = (0xC0, 0x26, 0xD3)
-FG = (0xFF, 0xFF, 0xFF)
+NAVY = (0x17, 0x36, 0x5C)
+WHITE = (0xFF, 0xFF, 0xFF)
+FOLD = (0x70, 0xA9, 0xED)
 
 
-def coverage(x, y):
-    """Colour at (x, y) in the 64x64 design space, or None for transparent."""
-    r = 14.0
-    cx, cy = min(max(x, r), 64 - r), min(max(y, r), 64 - r)
-    if (x - cx) ** 2 + (y - cy) ** 2 > r * r:
+def in_round_rect(x, y, l, t, r, b, rad):
+    if x < l or x > r or y < t or y > b:
+        return False
+    cx, cy = min(max(x, l + rad), r - rad), min(max(y, t + rad), b - rad)
+    return (x - cx) ** 2 + (y - cy) ** 2 <= rad * rad
+
+
+def dist_to_segment(x, y, a, b):
+    dx, dy = b[0] - a[0], b[1] - a[1]
+    t = max(0.0, min(1.0, ((x - a[0]) * dx + (y - a[1]) * dy) / (dx * dx + dy * dy)))
+    return math.hypot(x - (a[0] + t * dx), y - (a[1] + t * dy))
+
+
+def envelope(small):
+    return (14.0, 27.0, 86.0, 73.0) if small else (20.0, 32.0, 80.0, 70.0)
+
+
+def sample(x, y, small):
+    if not in_round_rect(x, y, 0, 0, 100, 100, 20):
         return None
-    l, rt, t, b = 14.0, 50.0, 20.0, 44.0
-    if l <= x <= rt and t <= y <= b:
-        edge = x - l < 2.5 or rt - x < 2.5 or y - t < 2.5 or b - y < 2.5
-        mid = (l + rt) / 2
-        flap_y = t + (mid - abs(x - mid) - l) * (12.0 / (mid - l))
-        if edge or (abs(y - flap_y) < 1.8 and y <= t + 13):
-            return FG
-    return BG
+    l, t, r, b = envelope(small)
+    if not in_round_rect(x, y, l, t, r, b, 4):
+        return NAVY
+    if not small and x >= 68 and y <= 44 and (x - 68) >= (y - 32):
+        return FOLD
+    mid = ((l + r) / 2, t + (b - t) * 0.55)
+    seam = 3.4 if small else 2.0
+    if dist_to_segment(x, y, (l + 1, t + 1), mid) < seam or dist_to_segment(x, y, mid, (r - 1, t + 1)) < seam:
+        return NAVY
+    return WHITE
 
 
 def render(size, ss=4):
+    small = size <= 24
     rows = []
     for py in range(size):
-        row = bytearray([0])  # PNG filter type
+        row = bytearray([0])
         for px in range(size):
             acc = [0, 0, 0, 0]
             for sy in range(ss):
                 for sx in range(ss):
-                    x = (px + (sx + 0.5) / ss) * 64 / size
-                    y = (py + (sy + 0.5) / ss) * 64 / size
-                    c = coverage(x, y)
+                    c = sample((px + (sx + 0.5) / ss) * 100 / size, (py + (sy + 0.5) / ss) * 100 / size, small)
                     if c:
                         acc[0] += c[0]; acc[1] += c[1]; acc[2] += c[2]; acc[3] += 255
-            n = ss * ss
-            a = acc[3] // n
-            if a:
+            a = acc[3] // (ss * ss)
+            if acc[3]:
                 k = acc[3] // 255
                 row += bytes([acc[0] // k, acc[1] // k, acc[2] // k, a])
             else:
@@ -59,7 +75,17 @@ def png(size):
             + chunk(b"IDAT", zlib.compress(raw, 9)) + chunk(b"IEND", b""))
 
 
+SVG = """<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 100 100">
+  <rect width="100" height="100" rx="20" fill="#17365C"/>
+  <rect x="20" y="32" width="60" height="38" rx="4" fill="#FFFFFF"/>
+  <path d="M21 33 L50 52.9 L79 33" fill="none" stroke="#17365C" stroke-width="4" stroke-linecap="round" stroke-linejoin="round"/>
+  <path d="M68 32 L76 32 Q80 32 80 36 L80 44 Z" fill="#70A9ED"/>
+</svg>
+"""
+
+
 def main():
+    root = os.path.join(os.path.dirname(__file__), "..", "assets")
     sizes = [16, 24, 32, 48, 64, 128, 256]
     images = [png(s) for s in sizes]
     header = struct.pack("<HHH", 0, 1, len(sizes))
@@ -68,10 +94,13 @@ def main():
     for s, img in zip(sizes, images):
         entries += struct.pack("<BBBBHHII", s % 256, s % 256, 0, 0, 1, 32, len(img), offset + len(data))
         data += img
-    out = os.path.join(os.path.dirname(__file__), "..", "assets", "icon.ico")
-    with open(out, "wb") as f:
+    with open(os.path.join(root, "icon.ico"), "wb") as f:
         f.write(header + entries + data)
-    print("wrote", os.path.normpath(out), len(header + entries + data), "bytes")
+    with open(os.path.join(root, "icon.svg"), "w", newline="\n") as f:
+        f.write(SVG)
+    with open(os.path.join(root, "icon-256.png"), "wb") as f:
+        f.write(images[-1])
+    print("wrote icon.ico, icon.svg, icon-256.png")
 
 
 if __name__ == "__main__":

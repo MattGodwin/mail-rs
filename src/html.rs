@@ -96,6 +96,8 @@ mod imp {
         shown: Option<u64>,
         visible: bool,
         bounds: Option<(i32, i32, u32, u32)>,
+        /// Areas (view-local physical pixels) cut out of the view for overlapping egui windows.
+        holes: Option<Vec<(i32, i32, i32, i32)>>,
     }
 
     fn respond(status: StatusCode, mime: &str, body: Vec<u8>, csp: Option<String>) -> Response<Cow<'static, [u8]>> {
@@ -169,7 +171,7 @@ mod imp {
                 .with_bounds(Rect { position: PhysicalPosition::new(0, 0).into(), size: PhysicalSize::new(1u32, 1u32).into() })
                 .build_as_child(window)
                 .map_err(|e| format!("The system web view isn't available ({e})"))?;
-            Ok(HtmlView { webview, _context: context, page, generation: 0, shown: None, visible: false, bounds: None })
+            Ok(HtmlView { webview, _context: context, page, generation: 0, shown: None, visible: false, bounds: None, holes: None })
         }
 
         /// Show a page. `key` identifies the content; unchanged keys don't reload.
@@ -188,10 +190,44 @@ mod imp {
             let b = (x, y, w.max(1), h.max(1));
             if self.bounds != Some(b) {
                 self.bounds = Some(b);
+                // The clip region is relative to the view size, so rebuild it.
+                self.holes = None;
                 let _ = self
                     .webview
                     .set_bounds(Rect { position: PhysicalPosition::new(b.0, b.1).into(), size: PhysicalSize::new(b.2, b.3).into() });
             }
+        }
+
+        /// Let egui windows and menus that overlap the view show through, without
+        /// resizing the view (which would reflow the email). On Windows this cuts
+        /// holes in the view's window region (other platforms hide the view instead;
+        /// see the caller).
+        pub fn set_holes(&mut self, holes: Vec<(i32, i32, i32, i32)>) {
+            if self.holes.as_ref() == Some(&holes) {
+                return;
+            }
+            #[cfg(windows)]
+            unsafe {
+                use windows_sys::Win32::Graphics::Gdi::{CombineRgn, CreateRectRgn, DeleteObject, SetWindowRgn, RGN_DIFF};
+                use wry::WebViewExtWindows;
+                let hwnd = self.webview.hwnd().0 as windows_sys::Win32::Foundation::HWND;
+                if holes.is_empty() {
+                    SetWindowRgn(hwnd, std::ptr::null_mut(), 1);
+                } else {
+                    let (_, _, w, h) = self.bounds.unwrap_or((0, 0, 1, 1));
+                    let region = CreateRectRgn(0, 0, w as i32, h as i32);
+                    for &(x1, y1, x2, y2) in &holes {
+                        let hole = CreateRectRgn(x1, y1, x2, y2);
+                        CombineRgn(region, region, hole, RGN_DIFF);
+                        DeleteObject(hole);
+                    }
+                    // On success the system owns the region.
+                    if SetWindowRgn(hwnd, region, 1) == 0 {
+                        DeleteObject(region);
+                    }
+                }
+            }
+            self.holes = Some(holes);
         }
 
         pub fn set_visible(&mut self, visible: bool) {

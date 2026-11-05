@@ -208,6 +208,17 @@ pub enum Ev {
         uid: u32,
     },
     Update(crate::update::Msg),
+    /// Account setup: server settings found for an email address.
+    Autoconfig {
+        setup: u64,
+        found: Option<crate::autoconfig::Found>,
+    },
+    /// Account setup: results of the incoming / outgoing sign-in checks.
+    Verified {
+        setup: u64,
+        imap: Result<(), String>,
+        smtp: Result<(), String>,
+    },
     /// A link clicked in the HTML view.
     #[cfg_attr(not(any(windows, target_os = "macos")), allow(dead_code))]
     Link(String),

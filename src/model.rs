@@ -45,20 +45,6 @@ pub enum Special {
     Trash,
 }
 
-impl Special {
-    pub fn icon(self) -> &'static str {
-        match self {
-            Special::Inbox => "📥",
-            Special::Drafts => "📝",
-            Special::Sent => "📤",
-            Special::Archive => "🗄",
-            Special::All => "🗃",
-            Special::Junk => "⚠",
-            Special::Trash => "🗑",
-        }
-    }
-}
-
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct FolderInfo {
     /// Raw (modified UTF-7) mailbox name as the server knows it.

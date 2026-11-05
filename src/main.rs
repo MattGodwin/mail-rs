@@ -2,6 +2,8 @@
 #![cfg_attr(all(not(debug_assertions), windows), windows_subsystem = "windows")]
 
 mod app;
+mod appicon;
+mod autoconfig;
 mod compose;
 mod config;
 mod drafts;
@@ -10,6 +12,7 @@ mod fixture_tests;
 mod formats;
 mod html;
 mod http;
+mod kit;
 mod model;
 mod net;
 mod notify;
@@ -17,6 +20,7 @@ mod oauth;
 mod secrets;
 mod smtp;
 mod store;
+mod theme;
 mod update;
 mod view;
 mod watcher;

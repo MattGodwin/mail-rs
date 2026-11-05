@@ -108,6 +108,10 @@ pub struct Settings {
     pub default_account: String,
     /// Download and install new releases automatically.
     pub auto_update: bool,
+    /// "system", "light" or "dark".
+    pub theme: String,
+    /// Denser message list rows.
+    pub compact: bool,
     /// Show the plain-text version of messages instead of HTML when both exist.
     pub prefer_plain_text: bool,
     /// Allow remote images, styles and fonts when displaying HTML mail.
@@ -127,6 +131,8 @@ impl Default for Settings {
             notify_preview: true,
             default_account: String::new(),
             auto_update: true,
+            theme: "system".into(),
+            compact: false,
             prefer_plain_text: false,
             load_remote_content: true,
         }
@@ -186,9 +192,6 @@ pub enum Provider {
 }
 
 impl Provider {
-    pub const ALL: [Provider; 6] =
-        [Provider::Gmail, Provider::Outlook, Provider::ICloud, Provider::Yahoo, Provider::Fastmail, Provider::Custom];
-
     pub fn label(self) -> &'static str {
         match self {
             Provider::Gmail => "Gmail / Google Workspace",

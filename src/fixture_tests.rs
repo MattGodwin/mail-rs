@@ -163,7 +163,7 @@ fn calendar_request_and_cancellation_keep_ics_and_timezone() {
         assert_eq!(inv.headline(), headline);
         assert_eq!(inv.location, "Room 4, garden office");
         assert_eq!(inv.organizer, "Priya Shah <priya@example.org>");
-        assert_eq!(inv.when, "Tue 10 Nov 2026, 14:30 (Europe/London) – Tue 10 Nov 2026, 15:30 (Europe/London)");
+        assert_eq!(inv.when, "Tue 10 Nov 2026 · 14:30 – 15:30 (Europe/London)");
         assert!(data.starts_with(b"BEGIN:VCALENDAR\r\n"));
         assert!(String::from_utf8_lossy(data).contains(&format!("METHOD:{method}\r\n")));
     }

@@ -128,6 +128,19 @@ fn ics_time(params: &str, v: &str) -> Option<String> {
     Some(format!("{}{tz}", t.format("%a %-d %b %Y, %H:%M")))
 }
 
+/// "Tue 10 Nov 2026, 14:30 (Z)" + "Tue 10 Nov 2026, 15:30 (Z)" -> "Tue 10 Nov 2026 · 14:30 – 15:30 (Z)".
+fn join_range(s: &str, e: &str) -> String {
+    match (s.split_once(", "), e.split_once(", ")) {
+        (Some((d1, t1)), Some((d2, t2))) if d1 == d2 => {
+            let tz = |t: &str| t.find(" (").map(|i| t[i..].to_string()).unwrap_or_default();
+            let (z1, z2) = (tz(t1), tz(t2));
+            let t1 = if z1 == z2 { t1.trim_end_matches(z1.as_str()) } else { t1 };
+            format!("{d1} · {t1} – {t2}")
+        }
+        _ => format!("{s} – {e}"),
+    }
+}
+
 pub fn parse_invite(ics: &str) -> Option<Invite> {
     let mut inv = Invite::default();
     let mut in_event = false;
@@ -159,7 +172,7 @@ pub fn parse_invite(ics: &str) -> Option<Invite> {
         return None;
     }
     inv.when = match (start, end) {
-        (Some(s), Some(e)) if s != e => format!("{s} – {e}"),
+        (Some(s), Some(e)) if s != e => join_range(&s, &e),
         (Some(s), _) => s,
         _ => String::new(),
     };
@@ -230,7 +243,7 @@ mod tests {
         assert_eq!(inv.summary, "Q4 roadmap review");
         assert_eq!(inv.location, "Room 4, 2nd floor");
         assert_eq!(inv.organizer, "Priya Shah <priya@example.org>");
-        assert!(inv.when.starts_with("Tue 10 Nov 2026, 14:30 (Europe/London) – "));
+        assert_eq!(inv.when, "Tue 10 Nov 2026 · 14:30 – 15:30 (Europe/London)");
         let all_day = parse_invite("BEGIN:VEVENT\nSUMMARY:Holiday\nDTSTART;VALUE=DATE:20261224\nEND:VEVENT").unwrap();
         assert_eq!(all_day.when, "Thu 24 Dec 2026 (all day)");
         assert!(parse_invite("BEGIN:VCALENDAR\nEND:VCALENDAR").is_none());

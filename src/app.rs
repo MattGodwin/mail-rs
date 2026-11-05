@@ -5,16 +5,17 @@
 use crate::compose::{self, Compose};
 use crate::config::{Account, AuthKind, Config, Provider, Security, Server};
 use crate::drafts;
+use crate::kit::{self, ic, Tone};
 use crate::model::{self, FolderIndex, FolderInfo, MsgFlag, Special, Summary};
 use crate::store::Store;
+use crate::theme::{self, ty};
 use crate::update::{self, Staged};
 use crate::view::{self, Block, View};
 use crate::watcher::{self, Watcher};
 use crate::worker::{self, AcctState, Cmd, Ev, Event, OpErr, OpId, Shared};
 use crate::{oauth, secrets};
 use eframe::egui::{
-    self, text::LayoutJob, text::TextWrapping, Align, Align2, Color32, FontFamily, FontId, Galley, Id, Key as K, Layout, Modifiers, Order,
-    Rect, RichText, Sense, Stroke, TextFormat, Vec2,
+    self, Align, Align2, Color32, FontFamily, FontId, Id, Key as K, Layout, Modifiers, Order, Rect, RichText, Sense, Stroke,
 };
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::path::PathBuf;
@@ -24,20 +25,12 @@ use std::sync::Arc;
 use std::thread::JoinHandle;
 use std::time::{Duration, Instant, SystemTime};
 
-const ROW_H: f32 = 52.0;
+const ROW_H: f32 = 60.0;
+const ROW_H_COMPACT: f32 = 48.0;
 const BODY_CACHE: usize = 48;
-const UNDO_WINDOW: Duration = Duration::from_secs(5);
+const UNDO_WINDOW: Duration = Duration::from_secs(10);
+const TOAST_FOR: Duration = Duration::from_secs(6);
 const PERSIST_AFTER: Duration = Duration::from_millis(1500);
-const ACCENT: Color32 = Color32::from_rgb(0xc0, 0x26, 0xd3);
-const GOOD: Color32 = Color32::from_rgb(0x10, 0xb9, 0x81);
-const ACCOUNT_COLORS: [Color32; 6] = [
-    Color32::from_rgb(0x3b, 0x82, 0xf6),
-    Color32::from_rgb(0x10, 0xb9, 0x81),
-    Color32::from_rgb(0xf5, 0x9e, 0x0b),
-    Color32::from_rgb(0xef, 0x44, 0x44),
-    Color32::from_rgb(0x8b, 0x5c, 0xf6),
-    Color32::from_rgb(0x06, 0xb6, 0xd4),
-];
 /// File types that are never opened directly from an email (save only).
 const RISKY_EXT: &[&str] = &[
     "exe", "com", "bat", "cmd", "scr", "pif", "msi", "msp", "js", "jse", "vbs", "vbe", "wsf", "wsh", "ps1", "psm1", "hta", "lnk", "jar",
@@ -198,6 +191,51 @@ struct Editor {
     notify: bool,
     oauth: OAuthState,
     error: Option<String>,
+    /// Account id reserved by the setup wizard (credentials are stored under it while verifying).
+    new_id: Option<String>,
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum SetupStep {
+    Email,
+    Detecting,
+    SignIn,
+    Manual,
+    Verify,
+    Done,
+}
+
+#[derive(Clone, PartialEq)]
+enum Check {
+    Waiting,
+    Running,
+    Ok,
+    Failed(String),
+}
+
+/// The add-account wizard: Email → Sign in → Verify → Done.
+struct Setup {
+    id: u64,
+    step: SetupStep,
+    ed: Editor,
+    detected: String,
+    show_password: bool,
+    incoming: Check,
+    outgoing: Check,
+    added: Option<usize>,
+    error: Option<String>,
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum SettingsPage {
+    Appearance,
+    Accounts,
+    Reading,
+    Privacy,
+    Notifications,
+    Sync,
+    Advanced,
+    About,
 }
 
 enum Confirm {
@@ -261,6 +299,7 @@ enum Action {
     AddToCalendar,
     SaveIcs,
     Unsubscribe,
+    CloseAccountDetail,
 }
 
 pub struct App {
@@ -303,7 +342,6 @@ pub struct App {
     list_scroll: (f32, f32),
     title_unread: usize,
     mono: bool,
-    bold: bool,
     quitting: bool,
     force_quit: bool,
     update: UpdateState,
@@ -311,6 +349,21 @@ pub struct App {
     started: Instant,
     last_update_check: Option<Instant>,
     restart_requested: bool,
+    /// Folder pane shown (wide windows) / drawer open (narrow windows).
+    nav_open: bool,
+    nav_drawer: bool,
+    /// Multi-selection in the message list (Ctrl/Shift+click) and its anchor row.
+    selection: HashSet<Key>,
+    sel_anchor: Option<usize>,
+    /// Server search scope: true = all inboxes, false = folder on screen.
+    search_all: bool,
+    /// Transient message shown as a toast (replaces the old status bar).
+    toast_text: String,
+    toast_at: Option<Instant>,
+    last_status: String,
+    banner_dismissed: bool,
+    setup: Option<Setup>,
+    settings_page: SettingsPage,
     /// Attached emails opened on top of the selected one.
     nested: Vec<View>,
     /// Bumped whenever the message on screen changes.
@@ -336,105 +389,93 @@ enum Preview {
 
 // ---------------------------------------------------------------- setup ---
 
-fn setup_style(ctx: &egui::Context) -> bool {
-    // Only Windows adds system fonts; elsewhere the defaults are used as-is.
-    #[cfg_attr(not(windows), allow(unused_mut))]
-    let mut fonts = egui::FontDefinitions::default();
-    #[cfg_attr(not(windows), allow(unused_mut))]
-    let mut bold = false;
-    #[cfg(windows)]
+/// Turn a raw sign-in failure into advice a person can act on.
+fn explain_signin_error(e: &str, provider: Provider) -> String {
+    let l = e.to_ascii_lowercase();
+    let app_pw = matches!(provider, Provider::Gmail | Provider::ICloud | Provider::Yahoo | Provider::Fastmail);
+    if l.contains("authenticat")
+        || l.contains("invalid credentials")
+        || l.contains("login")
+        || l.contains("sign-in")
+        || l.contains("535")
+        || l.contains("password")
     {
-        let dir = PathBuf::from(std::env::var("WINDIR").unwrap_or_else(|_| "C:\\Windows".into())).join("Fonts");
-        let load = |f: &str| std::fs::read(dir.join(f)).ok();
-        if let Some(b) = load("segoeui.ttf") {
-            fonts.font_data.insert("ui".into(), Arc::new(egui::FontData::from_owned(b)));
-            fonts.families.entry(FontFamily::Proportional).or_default().insert(0, "ui".into());
+        if app_pw {
+            format!("The password was rejected. {} needs an app password, not your normal password.", provider.label())
+        } else {
+            "The user name or password was rejected. Check them and try again.".into()
         }
-        if let Some(b) = load("segoeuib.ttf") {
-            fonts.font_data.insert("ui-bold".into(), Arc::new(egui::FontData::from_owned(b)));
-            let mut fam = vec!["ui-bold".to_string()];
-            fam.extend(fonts.families[&FontFamily::Proportional].iter().cloned());
-            fonts.families.insert(FontFamily::Name("bold".into()), fam);
-            bold = true;
-        }
-        if let Some(b) = load("seguisym.ttf") {
-            fonts.font_data.insert("sym".into(), Arc::new(egui::FontData::from_owned(b)));
-            for fam in fonts.families.values_mut() {
-                fam.push("sym".into());
-            }
-        }
-        if let Some(b) = load("consola.ttf") {
-            fonts.font_data.insert("mono".into(), Arc::new(egui::FontData::from_owned(b)));
-            fonts.families.entry(FontFamily::Monospace).or_default().insert(0, "mono".into());
-        }
+    } else if l.contains("resolve") || l.contains("dns") || l.contains("no such host") {
+        "Couldn't find that server. Check the server name in the server settings.".into()
+    } else if l.contains("tls") || l.contains("certificate") || l.contains("handshake") {
+        "A secure connection couldn't be established. Check the security setting and port.".into()
+    } else if l.contains("timed out") || l.contains("connect") {
+        "Couldn't reach the server. Check your connection, the server name and port.".into()
+    } else {
+        e.to_string()
     }
-    ctx.set_fonts(fonts);
-    ctx.all_styles_mut(|s| {
-        use egui::TextStyle::*;
-        s.text_styles.insert(Body, FontId::proportional(14.0));
-        s.text_styles.insert(Button, FontId::proportional(14.0));
-        s.text_styles.insert(Heading, FontId::proportional(20.0));
-        s.text_styles.insert(Small, FontId::proportional(11.5));
-        s.text_styles.insert(Monospace, FontId::monospace(13.0));
-        s.spacing.item_spacing = egui::vec2(8.0, 6.0);
-        s.spacing.button_padding = egui::vec2(8.0, 4.0);
-        s.spacing.interact_size.y = 24.0;
-    });
-    bold
+}
+
+/// A borderless single-line field for the compose rows.
+fn flat_edit<'a>(val: &'a mut String, hint: &str, w: f32) -> egui::TextEdit<'a> {
+    egui::TextEdit::singleline(val)
+        .hint_text(hint)
+        .frame(egui::Frame::NONE)
+        .margin(egui::Margin::symmetric(0, 0))
+        .align(Align2::LEFT_CENTER)
+        .min_size(egui::vec2(0.0, 40.0))
+        .desired_width(w)
+}
+
+/// "Name <addr>" -> (name, addr); a bare address gives ("", addr).
+fn split_mailbox(s: &str) -> (String, String) {
+    match (s.rfind('<'), s.rfind('>')) {
+        (Some(a), Some(b)) if a < b => (s[..a].trim().trim_matches('"').to_string(), s[a + 1..b].trim().to_string()),
+        _ => (String::new(), s.trim().to_string()),
+    }
+}
+
+/// Short human file type for attachment tiles ("PDF", "PNG image", …).
+fn file_kind(name: &str, mime: &str) -> String {
+    match mime {
+        "message/rfc822" => return "Email".into(),
+        "text/calendar" => return "Invitation".into(),
+        m if m.starts_with("image/") => return format!("{} image", m.trim_start_matches("image/").to_uppercase()),
+        _ => {}
+    }
+    match name.rsplit_once('.') {
+        Some((_, ext)) if ext.len() <= 5 => ext.to_uppercase(),
+        _ => "File".into(),
+    }
 }
 
 /// Window icon: an envelope on the app colour, drawn procedurally.
 pub fn icon() -> egui::IconData {
     let n = 64usize;
-    let mut rgba = vec![0u8; n * n * 4];
-    let inside_round = |x: f32, y: f32, r: f32, max: f32| {
-        let cx = x.clamp(r, max - r);
-        let cy = y.clamp(r, max - r);
-        (x - cx).powi(2) + (y - cy).powi(2) <= r * r
-    };
-    for y in 0..n {
-        for x in 0..n {
-            let (fx, fy) = (x as f32 + 0.5, y as f32 + 0.5);
-            let i = (y * n + x) * 4;
-            if !inside_round(fx, fy, 14.0, 64.0) {
-                continue;
-            }
-            let mut c = [0xc0, 0x26, 0xd3, 0xff];
-            let (l, r, t, b) = (14.0, 50.0, 20.0, 44.0);
-            if fx >= l && fx <= r && fy >= t && fy <= b {
-                let edge = fx - l < 2.5 || r - fx < 2.5 || fy - t < 2.5 || b - fy < 2.5;
-                let mid = (l + r) / 2.0;
-                let flap_y = t + (mid - (fx - mid).abs() - l) * (12.0 / (mid - l));
-                let flap = (fy - flap_y).abs() < 1.8 && fy <= t + 13.0;
-                if edge || flap {
-                    c = [0xff, 0xff, 0xff, 0xff];
-                }
-            }
-            rgba[i..i + 4].copy_from_slice(&c);
-        }
-    }
+    let rgba = crate::appicon::render(n);
     egui::IconData { rgba, width: n as u32, height: n as u32 }
 }
 
-fn one_line_galley(ui: &egui::Ui, text: String, font: FontId, color: Color32, max_width: f32) -> Arc<Galley> {
-    let mut job = LayoutJob::single_section(text, TextFormat::simple(font, color));
-    job.wrap = TextWrapping { max_width, max_rows: 1, break_anywhere: true, overflow_character: Some('…') };
-    ui.painter().layout_job(job)
+/// What the trailing hover actions on a list row asked for.
+enum RowAct {
+    Archive,
+    Delete,
+    ToggleRead,
+    ToggleStar,
 }
 
-fn ago(t: SystemTime) -> String {
-    let s = SystemTime::now().duration_since(t).unwrap_or_default().as_secs();
-    match s {
-        0..=59 => "just now".into(),
-        60..=3599 => format!("{} min ago", s / 60),
-        3600..=86399 => format!("{} h ago", s / 3600),
-        _ => format!("{} d ago", s / 86400),
-    }
+struct RowState {
+    selected: bool,
+    checked: bool,
+    compact: bool,
+    acct_label: String,
 }
 
-fn paint_row(ui: &mut egui::Ui, r: &Row, selected: bool, stripe: Option<Color32>, bold: bool, acct_label: &str) -> egui::Response {
+fn paint_row(ui: &mut egui::Ui, r: &Row, st: &RowState) -> (egui::Response, Option<RowAct>) {
+    let p = kit::pal(ui);
+    let h = if st.compact { ROW_H_COMPACT } else { ROW_H };
     let w = ui.available_width();
-    let (rect, resp) = ui.allocate_exact_size(egui::vec2(w, ROW_H), Sense::click());
+    let (rect, resp) = ui.allocate_exact_size(egui::vec2(w, h), Sense::click());
     // Screen readers: one selectable item per message with everything it shows.
     let label = format!(
         "{}{}{}{}, {}, {}{}",
@@ -444,65 +485,110 @@ fn paint_row(ui: &mut egui::Ui, r: &Row, selected: bool, stripe: Option<Color32>
         r.s.sender(),
         if r.s.subject.is_empty() { "no subject" } else { &r.s.subject },
         model::fmt_date_long(r.s.date),
-        if acct_label.is_empty() { String::new() } else { format!(", {acct_label}") }
+        if st.acct_label.is_empty() { String::new() } else { format!(", {}", st.acct_label) }
     );
-    resp.widget_info(|| egui::WidgetInfo::selected(egui::Role::ListBoxOption, true, selected, &label));
+    resp.widget_info(|| egui::WidgetInfo::selected(egui::Role::ListBoxOption, true, st.selected || st.checked, &label));
+    let mut act = None;
     if !ui.is_rect_visible(rect) {
-        return resp;
+        return (resp, act);
     }
-    let vis = ui.visuals().clone();
+    let hovered = ui.rect_contains_pointer(rect);
     let painter = ui.painter().clone();
-    let card = rect.shrink2(egui::vec2(4.0, 1.5));
-    if selected {
-        painter.rect_filled(card, 6.0, vis.selection.bg_fill);
-    } else if resp.hovered() {
-        painter.rect_filled(card, 6.0, vis.widgets.hovered.weak_bg_fill);
+    if st.selected || st.checked {
+        painter.rect_filled(rect, 0.0, p.selected);
+        painter.rect_filled(Rect::from_min_size(rect.min, egui::vec2(3.0, h)), 0.0, p.accent);
+    } else if hovered {
+        painter.rect_filled(rect, 0.0, p.hover);
     }
     if resp.has_focus() {
-        painter.rect_stroke(card, 6.0, vis.selection.stroke, egui::StrokeKind::Inside);
-    }
-    let text = if selected { vis.selection.stroke.color } else { vis.text_color() };
-    let strong = if selected { text } else { vis.strong_text_color() };
-    let weak = if selected { text } else { vis.weak_text_color() };
-    if let Some(c) = stripe {
-        painter.rect_filled(Rect::from_min_size(rect.min + egui::vec2(5.0, 9.0), egui::vec2(3.0, ROW_H - 18.0)), 1.5, c);
+        painter.rect_stroke(rect.shrink(1.0), egui::CornerRadius::same(4), Stroke::new(2.0, p.accent), egui::StrokeKind::Inside);
     }
     let unread = !r.s.seen;
-    if unread {
-        painter.circle_filled(egui::pos2(rect.left() + 15.0, rect.top() + 17.0), 3.5, ACCENT);
-    }
     let left = rect.left() + 24.0;
-    let right = rect.right() - 12.0;
-    let date = one_line_galley(ui, model::fmt_date_short(r.s.date), FontId::proportional(12.0), weak, 200.0);
-    let date_x = right - date.size().x;
-    painter.galley(egui::pos2(date_x, rect.top() + 9.0), date, weak);
-    let mut icons = String::new();
-    if r.s.answered {
-        icons.push('↩');
+    let right = rect.right() - 16.0;
+    if unread {
+        painter.circle_filled(egui::pos2(rect.left() + 12.0, rect.top() + if st.compact { 16.0 } else { 20.0 }), 4.0, p.accent);
     }
-    if r.s.attach {
-        icons.push('📎');
+    let line1_y = rect.top() + if st.compact { 7.0 } else { 10.0 };
+    let line2_y = rect.top() + if st.compact { 26.0 } else { 32.0 };
+
+    // Trailing area: date + indicators, or hover actions (same width, so text never shifts).
+    let trailing_w = 136.0;
+    let trailing = Rect::from_min_max(egui::pos2(right - trailing_w, rect.top()), egui::pos2(right, rect.top() + 30.0));
+    if hovered {
+        let acts: [(egui_material_icons::MaterialIcon, &str, RowAct); 4] = [
+            (ic::ICON_ARCHIVE, "Archive (E)", RowAct::Archive),
+            (ic::ICON_DELETE, "Delete (Del)", RowAct::Delete),
+            (
+                if unread { ic::ICON_DRAFTS } else { ic::ICON_MARK_EMAIL_UNREAD },
+                if unread { "Mark as read (U)" } else { "Mark as unread (U)" },
+                RowAct::ToggleRead,
+            ),
+            (ic::ICON_STAR, if r.s.flagged { "Unstar (S)" } else { "Star (S)" }, RowAct::ToggleStar),
+        ];
+        let mut x = right - 4.0 * 32.0;
+        for (icon, tip, a) in acts {
+            let br = Rect::from_min_size(egui::pos2(x, rect.top() + (if st.compact { 2.0 } else { 6.0 })), egui::vec2(32.0, 32.0));
+            let id = resp.id.with(tip);
+            let b = ui.interact(br, id, Sense::click()).on_hover_text(tip);
+            if b.hovered() {
+                painter.rect_filled(br.shrink(2.0), egui::CornerRadius::same(6), if st.selected { p.hover } else { p.selected });
+            }
+            let starred = matches!(a, RowAct::ToggleStar) && r.s.flagged;
+            let color = if starred { p.warning } else { p.text_secondary };
+            let font = FontId::new(18.0, if starred { icon.filled().font_family() } else { icon.outlined().font_family() });
+            painter.text(br.center(), Align2::CENTER_CENTER, <&str>::from(icon), font, color);
+            if b.clicked() {
+                act = Some(a);
+            }
+            x += 32.0;
+        }
+    } else {
+        let date = kit::one_line(
+            ui,
+            model::fmt_date_short(r.s.date),
+            theme::regular(ty::META),
+            if unread { p.text } else { p.text_secondary },
+            120.0,
+        );
+        let dx = right - date.size().x;
+        painter.galley(egui::pos2(dx, line1_y + 1.0), date, p.text);
+        let mut ix = dx - 6.0;
+        let mut indicator = |icon: egui_material_icons::MaterialIcon, filled: bool, color: Color32| {
+            ix -= 18.0;
+            let font = FontId::new(16.0, if filled { icon.filled().font_family() } else { icon.outlined().font_family() });
+            painter.text(egui::pos2(ix + 8.0, line1_y + 9.0), Align2::CENTER_CENTER, <&str>::from(icon), font, color);
+        };
+        if r.s.flagged {
+            indicator(ic::ICON_STAR, true, p.warning);
+        }
+        if r.s.attach {
+            indicator(ic::ICON_ATTACH_FILE, false, p.text_secondary);
+        }
+        if r.s.answered {
+            indicator(ic::ICON_REPLY, false, p.text_secondary);
+        }
     }
-    if r.s.flagged {
-        icons.push('★');
-    }
-    let icon_g =
-        one_line_galley(ui, icons, FontId::proportional(12.0), if r.s.flagged { Color32::from_rgb(0xf5, 0x9e, 0x0b) } else { weak }, 200.0);
-    let icon_x = date_x - icon_g.size().x - 6.0;
-    painter.galley(egui::pos2(icon_x, rect.top() + 9.0), icon_g, weak);
-    let from_font = if unread && bold { FontId::new(14.0, FontFamily::Name("bold".into())) } else { FontId::proportional(14.0) };
     let sender = if r.s.sender().is_empty() { "(unknown sender)".to_string() } else { r.s.sender().to_string() };
-    let from = one_line_galley(ui, sender, from_font, if unread { strong } else { text }, (icon_x - left - 8.0).max(10.0));
-    painter.galley(egui::pos2(left, rect.top() + 7.0), from, text);
+    let from_font = if unread { theme::semibold(ty::UI) } else { theme::regular(ty::UI) };
+    let from = kit::one_line(ui, sender, from_font, p.text, (trailing.left() - left - 8.0).max(10.0));
+    painter.galley(egui::pos2(left, line1_y), from, p.text);
     let subject = if r.s.subject.is_empty() { "(no subject)".to_string() } else { r.s.subject.clone() };
-    let subj = one_line_galley(ui, subject, FontId::proportional(13.0), if unread { text } else { weak }, (right - left).max(10.0));
-    painter.galley(egui::pos2(left, rect.top() + 28.0), subj, text);
-    painter.hline(
-        (rect.left() + 12.0)..=(rect.right() - 12.0),
-        rect.bottom() - 0.5,
-        Stroke::new(0.5_f32, vis.widgets.noninteractive.bg_stroke.color),
+    let acct_w = if st.acct_label.is_empty() { 0.0 } else { 120.0 };
+    let subj = kit::one_line(
+        ui,
+        subject,
+        if unread { theme::semibold(ty::UI - 1.0) } else { theme::regular(ty::UI - 1.0) },
+        if unread { p.text } else { p.text_secondary },
+        (right - left - acct_w).max(10.0),
     );
-    resp
+    painter.galley(egui::pos2(left, line2_y), subj, p.text);
+    if !st.acct_label.is_empty() {
+        let g = kit::one_line(ui, st.acct_label.clone(), theme::regular(ty::META), p.text_disabled, acct_w - 8.0);
+        painter.galley(egui::pos2(right - g.size().x, line2_y + 1.0), g, p.text);
+    }
+    painter.hline((rect.left() + 16.0)..=(rect.right()), rect.bottom() - 0.5, Stroke::new(1.0, p.divider));
+    (resp, act)
 }
 
 fn compose_layer(id: u64) -> egui::LayerId {
@@ -522,8 +608,9 @@ fn smtp_hint(e: &str) -> String {
 
 impl App {
     pub fn new(cc: &eframe::CreationContext<'_>) -> App {
-        let bold = setup_style(&cc.egui_ctx);
         let cfg = Config::load();
+        theme::install_fonts(&cc.egui_ctx);
+        theme::install(&cc.egui_ctx, &cfg.settings.theme);
         let (tx, rx) = std::sync::mpsc::channel();
         let mut app = App {
             cfg: cfg.clone(),
@@ -563,7 +650,6 @@ impl App {
             list_scroll: (0.0, 0.0),
             title_unread: usize::MAX,
             mono: false,
-            bold,
             quitting: false,
             force_quit: false,
             update: UpdateState::Idle,
@@ -571,6 +657,17 @@ impl App {
             started: Instant::now(),
             last_update_check: None,
             restart_requested: false,
+            nav_open: true,
+            nav_drawer: false,
+            selection: HashSet::new(),
+            sel_anchor: None,
+            search_all: false,
+            toast_text: String::new(),
+            toast_at: None,
+            last_status: String::new(),
+            banner_dismissed: false,
+            setup: None,
+            settings_page: SettingsPage::Appearance,
             nested: Vec::new(),
             view_seq: 0,
             previews: HashMap::new(),
@@ -748,6 +845,53 @@ impl App {
                     self.sent(compose, result);
                     continue;
                 }
+                Ev::Autoconfig { setup, found } => {
+                    let settings = self.cfg.settings.clone();
+                    if let Some(st) = self.setup.as_mut().filter(|x| x.id == setup && x.step == SetupStep::Detecting) {
+                        match found {
+                            Some(crate::autoconfig::Found::Provider(pv, source)) => {
+                                Self::apply_preset(&mut st.ed, pv, &settings);
+                                st.detected = format!("{} · found via {source}", pv.label());
+                                st.step = SetupStep::SignIn;
+                            }
+                            Some(crate::autoconfig::Found::Servers { imap, smtp, local_user, source }) => {
+                                Self::apply_preset(&mut st.ed, Provider::Custom, &settings);
+                                st.ed.imap = imap;
+                                st.ed.smtp = smtp;
+                                if local_user {
+                                    st.ed.username = st.ed.email.split('@').next().unwrap_or("").to_string();
+                                    st.ed.username_touched = true;
+                                }
+                                st.detected = format!("{} · found via {source}", st.ed.imap.host);
+                                st.step = SetupStep::SignIn;
+                            }
+                            None => {
+                                Self::apply_preset(&mut st.ed, Provider::Custom, &settings);
+                                st.detected = "We couldn't find settings for this address automatically.".into();
+                                st.step = SetupStep::Manual;
+                            }
+                        }
+                    }
+                    continue;
+                }
+                Ev::Verified { setup, imap, smtp } => {
+                    let mut done = false;
+                    if let Some(st) = self.setup.as_mut().filter(|x| x.id == setup) {
+                        st.incoming = match imap {
+                            Ok(()) => Check::Ok,
+                            Err(e) => Check::Failed(explain_signin_error(&e, st.ed.provider)),
+                        };
+                        st.outgoing = match smtp {
+                            Ok(()) => Check::Ok,
+                            Err(e) => Check::Failed(explain_signin_error(&e, st.ed.provider)),
+                        };
+                        done = st.incoming == Check::Ok && st.outgoing == Check::Ok;
+                    }
+                    if done {
+                        self.finish_setup();
+                    }
+                    continue;
+                }
                 Ev::Update(msg) => {
                     self.update = match msg {
                         update::Msg::UpToDate => UpdateState::UpToDate,
@@ -785,7 +929,8 @@ impl App {
                     continue;
                 }
                 Ev::OAuth { editor, result } => {
-                    if let Some(ed) = self.editor.as_mut().filter(|e| e.id == editor) {
+                    let wizard = self.setup.as_mut().map(|s| &mut s.ed).filter(|e| e.id == editor);
+                    if let Some(ed) = wizard.or(self.editor.as_mut().filter(|e| e.id == editor)) {
                         ed.oauth = match result {
                             Ok(t) => OAuthState::Done(t),
                             Err(e) => OAuthState::Failed(e),
@@ -873,7 +1018,14 @@ impl App {
                     self.open(key);
                     self.scroll_to_cur = true;
                 }
-                Ev::Done { .. } | Ev::Sent { .. } | Ev::OAuth { .. } | Ev::Update(_) | Ev::Link(_) | Ev::Preview { .. } => {}
+                Ev::Done { .. }
+                | Ev::Sent { .. }
+                | Ev::OAuth { .. }
+                | Ev::Update(_)
+                | Ev::Autoconfig { .. }
+                | Ev::Verified { .. }
+                | Ev::Link(_)
+                | Ev::Preview { .. } => {}
             }
         }
     }
@@ -1877,25 +2029,37 @@ impl App {
 
     fn ui_update_banner(&mut self, root: &mut egui::Ui) {
         let ctx = &root.ctx().clone();
+        let p = theme::palette(ctx);
         let Some(s) = &self.staged else { return };
+        if self.banner_dismissed {
+            return;
+        }
         let (version, url, mode) = (s.version.to_string(), s.url.clone(), s.mode);
         egui::Panel::top("update-banner")
-            .frame(egui::Frame::side_top_panel(&ctx.global_style()).inner_margin(egui::Margin::symmetric(12, 5)))
+            .exact_size(40.0)
+            .show_separator_line(false)
+            .frame(egui::Frame::new().fill(p.accent_subtle).inner_margin(egui::Margin::symmetric(16, 4)))
             .show(root, |ui| {
-                ui.horizontal(|ui| {
-                    ui.label(RichText::new("✨").color(ACCENT));
+                ui.horizontal_centered(|ui| {
+                    ui.label(kit::glyph(ic::ICON_SYSTEM_UPDATE, 18.0, p.accent));
                     let text = match mode {
-                        update::Mode::Installer => {
-                            format!("Mail {version} is ready to install. It installs automatically when you close Mail.")
-                        }
-                        update::Mode::Portable => format!("Mail {version} has been downloaded. It starts the next time you open Mail."),
+                        update::Mode::Installer => format!("Mail {version} is ready. It installs when you close Mail."),
+                        update::Mode::Portable => format!("Mail {version} is ready. It starts next time you open Mail."),
                     };
-                    ui.label(text);
-                    if ui.add(egui::Button::new(RichText::new("Restart now").color(Color32::WHITE)).fill(ACCENT)).clicked() {
+                    ui.label(RichText::new(text).color(p.text));
+                    if ui
+                        .add(egui::Button::new(RichText::new("Restart now").font(theme::semibold(ty::UI)).color(p.accent)).frame(false))
+                        .clicked()
+                    {
                         self.restart_requested = true;
                         ctx.send_viewport_cmd(egui::ViewportCommand::Close);
                     }
-                    ui.hyperlink_to("What's new", url);
+                    ui.hyperlink_to(RichText::new("What's new").color(p.accent), url);
+                    ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                        if kit::icon_button(ui, ic::ICON_CLOSE, "Dismiss").clicked() {
+                            self.banner_dismissed = true;
+                        }
+                    });
                 });
             });
     }
@@ -1993,12 +2157,37 @@ impl App {
             Action::AddToCalendar => self.invite_file(true),
             Action::SaveIcs => self.invite_file(false),
             Action::Unsubscribe => self.unsubscribe(),
+            Action::CloseAccountDetail => self.editor = None,
         }
     }
 
     // ---------------------------------------------------- account editor ---
 
     fn open_editor(&mut self, editing: Option<usize>) {
+        if editing.is_some() {
+            self.settings_open = true;
+            self.settings_page = SettingsPage::Accounts;
+        }
+        self.open_editor_inner(editing);
+        if editing.is_none() {
+            if let Some(ed) = self.editor.take() {
+                let id = self.id();
+                self.setup = Some(Setup {
+                    id,
+                    step: SetupStep::Email,
+                    ed: Editor { new_id: Some(crate::config::new_account_id()), ..ed },
+                    detected: String::new(),
+                    show_password: false,
+                    incoming: Check::Waiting,
+                    outgoing: Check::Waiting,
+                    added: None,
+                    error: None,
+                });
+            }
+        }
+    }
+
+    fn open_editor_inner(&mut self, editing: Option<usize>) {
         let id = self.id();
         let s = self.cfg.settings.clone();
         let ed = match editing.and_then(|i| self.accts.get(i)).filter(|a| a.live()) {
@@ -2024,6 +2213,7 @@ impl App {
                     notify: c.notify,
                     oauth: OAuthState::Idle,
                     error: None,
+                    new_id: None,
                 }
             }
             None => {
@@ -2047,6 +2237,7 @@ impl App {
                     notify: true,
                     oauth: OAuthState::Idle,
                     error: None,
+                    new_id: None,
                 };
                 Self::apply_preset(&mut ed, Provider::Gmail, &s);
                 ed
@@ -2111,7 +2302,7 @@ impl App {
             }
         }
         let existing = ed.editing.and_then(|i| self.accts.get(i)).map(|a| a.cfg.clone());
-        let id = existing.as_ref().map(|a| a.id.clone()).unwrap_or_else(crate::config::new_account_id);
+        let id = existing.as_ref().map(|a| a.id.clone()).or_else(|| ed.new_id.clone()).unwrap_or_else(crate::config::new_account_id);
         match ed.auth {
             AuthKind::Password => {
                 if !ed.password.is_empty() {
@@ -2165,292 +2356,440 @@ impl App {
 
     fn ui_top(&mut self, root: &mut egui::Ui) {
         let ctx = &root.ctx().clone();
-        egui::Panel::top("top").frame(egui::Frame::side_top_panel(&ctx.global_style()).inner_margin(egui::Margin::symmetric(10, 7))).show(
-            root,
-            |ui| {
-                ui.horizontal(|ui| {
-                    if ui
-                        .add(egui::Button::new(RichText::new("✏  Compose").color(Color32::WHITE)).fill(ACCENT))
-                        .on_hover_text("New message (C)")
-                        .clicked()
-                    {
-                        self.acts.push(Action::Compose);
-                    }
-                    if ui.button("⟳").on_hover_text("Check for new mail (F5)").clicked() {
-                        self.acts.push(Action::Refresh);
-                    }
-                    ui.add_space(8.0);
-                    let scope = match &self.sel {
-                        Sel::Folder(i, f) => self.accts[*i].folder_display(f),
-                        _ => "all inboxes".to_string(),
-                    };
-                    let edit = egui::TextEdit::singleline(&mut self.filter)
-                        .hint_text(format!("🔍  Filter · Enter searches {scope} on the server  ( / )"))
-                        .desired_width(360.0);
-                    let r = ui.add(edit);
-                    if self.focus_filter {
-                        r.request_focus();
-                        self.focus_filter = false;
-                    }
-                    if r.changed() {
-                        self.rows_dirty = true;
-                    }
-                    if r.lost_focus() && ui.input(|i| i.key_pressed(K::Enter)) {
-                        self.acts.push(Action::ServerSearch);
-                    }
-                    if r.has_focus() && ui.input(|i| i.key_pressed(K::Escape)) {
-                        if matches!(self.sel, Sel::Search(_)) {
-                            self.acts.push(Action::Select(Sel::Unified));
+        let p = theme::palette(ctx);
+        let narrow = ctx.content_rect().width() < 1100.0;
+        egui::Panel::top("top")
+            .exact_size(56.0)
+            .frame(egui::Frame::new().fill(p.window).inner_margin(egui::Margin { left: 8, right: 12, top: 12, bottom: 12 }))
+            .show(root, |ui| {
+                ui.horizontal_centered(|ui| {
+                    if kit::icon_button(ui, ic::ICON_MENU, "Show or hide folders").clicked() {
+                        if narrow {
+                            self.nav_drawer = !self.nav_drawer;
+                        } else {
+                            self.nav_open = !self.nav_open;
                         }
-                        self.filter.clear();
-                        self.rows_dirty = true;
                     }
+                    ui.add_space(4.0);
+                    ui.label(RichText::new("Mail").font(theme::semibold(ty::HEADING)).color(p.text));
+                    ui.add_space(24.0);
+
+                    // Search: typing filters downloaded mail; Enter searches the server.
+                    let search_w = (ui.available_width() - 150.0).clamp(240.0, 720.0);
+                    let in_folder = matches!(self.sel, Sel::Folder(..));
+                    egui::Frame::new()
+                        .fill(p.input)
+                        .stroke(Stroke::new(1.0, p.divider))
+                        .corner_radius(egui::CornerRadius::same(8))
+                        .inner_margin(egui::Margin { left: 10, right: 4, top: 2, bottom: 2 })
+                        .show(ui, |ui| {
+                            ui.set_width(search_w);
+                            ui.horizontal(|ui| {
+                                ui.label(kit::glyph(ic::ICON_SEARCH, 20.0, p.text_secondary));
+                                let scope_w = if in_folder { 128.0 } else { 0.0 };
+                                let clear_w = if self.filter.is_empty() { 0.0 } else { 32.0 };
+                                let edit = egui::TextEdit::singleline(&mut self.filter)
+                                    .hint_text("Search mail")
+                                    .frame(egui::Frame::NONE)
+                                    .margin(egui::Margin::symmetric(4, 7))
+                                    .align(Align2::LEFT_CENTER)
+                                    .desired_width((ui.available_width() - scope_w - clear_w - 8.0).max(80.0));
+                                let r = ui.add(edit);
+                                if self.focus_filter {
+                                    r.request_focus();
+                                    self.focus_filter = false;
+                                }
+                                if r.changed() {
+                                    self.rows_dirty = true;
+                                }
+                                if r.lost_focus() && ui.input(|i| i.key_pressed(K::Enter)) {
+                                    self.acts.push(Action::ServerSearch);
+                                }
+                                if r.has_focus() && ui.input(|i| i.key_pressed(K::Escape)) {
+                                    if matches!(self.sel, Sel::Search(_)) {
+                                        self.acts.push(Action::Select(Sel::Unified));
+                                    }
+                                    self.filter.clear();
+                                    self.rows_dirty = true;
+                                }
+                                if !self.filter.is_empty() && kit::icon_button(ui, ic::ICON_CLOSE, "Clear search (Esc)").clicked() {
+                                    if matches!(self.sel, Sel::Search(_)) {
+                                        self.acts.push(Action::Select(Sel::Unified));
+                                    }
+                                    self.filter.clear();
+                                    self.rows_dirty = true;
+                                }
+                                if in_folder {
+                                    egui::ComboBox::from_id_salt("search-scope")
+                                        .selected_text(
+                                            RichText::new(if self.search_all { "All inboxes" } else { "This folder" }).size(ty::META + 1.0),
+                                        )
+                                        .width(112.0)
+                                        .show_ui(ui, |ui| {
+                                            ui.selectable_value(&mut self.search_all, false, "This folder");
+                                            ui.selectable_value(&mut self.search_all, true, "All inboxes");
+                                        })
+                                        .response
+                                        .on_hover_text("Where Enter searches on the server");
+                                }
+                            });
+                        });
+
                     ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
-                        if ui.button("⚙").on_hover_text("Settings").clicked() {
+                        if kit::icon_button(ui, ic::ICON_SETTINGS, "Settings").clicked() {
                             self.settings_open = true;
                         }
-                        if ui.button("?").on_hover_text("Keyboard shortcuts (?)").clicked() {
+                        if kit::icon_button(ui, ic::ICON_HELP, "Keyboard shortcuts (?)").clicked() {
                             self.shortcuts_open = true;
                         }
-                        if ui.button("+ Account").clicked() {
-                            self.acts.push(Action::AddAccount);
+                        if kit::icon_button(ui, ic::ICON_REFRESH, "Check for new mail (F5)").clicked() {
+                            self.acts.push(Action::Refresh);
                         }
                         if self.accts.iter().any(|a| a.busy) {
-                            ui.spinner();
+                            ui.add(egui::Spinner::new().size(16.0).color(p.text_secondary));
                         }
                     });
                 });
-            },
-        );
+            });
     }
 
-    fn ui_status(&mut self, root: &mut egui::Ui) {
-        let ctx = &root.ctx().clone();
-        egui::Panel::bottom("status")
-            .frame(egui::Frame::side_top_panel(&ctx.global_style()).inner_margin(egui::Margin::symmetric(10, 3)))
-            .show(root, |ui| {
-                ui.horizontal(|ui| {
-                    let text = if self.status.is_empty() { "Ready".to_string() } else { self.status.clone() };
-                    ui.add(egui::Label::new(RichText::new(text).small().weak()).truncate());
-                });
-            });
+    /// Transient notices (what the old status bar showed) appear as a toast.
+    fn track_status(&mut self) {
+        if self.status != self.last_status {
+            self.last_status = self.status.clone();
+            if !self.status.is_empty() {
+                self.toast_text = self.status.clone();
+                self.toast_at = Some(Instant::now());
+            }
+        }
     }
 
     fn ui_toast(&mut self, ctx: &egui::Context) {
-        let Some(p) = self.pending.last() else { return };
-        let label = p.label.clone();
-        let left = p.deadline.saturating_duration_since(Instant::now()).as_secs() + 1;
-        egui::Area::new(Id::unique("undo-toast")).order(Order::Foreground).anchor(Align2::LEFT_BOTTOM, egui::vec2(16.0, -34.0)).show(
+        let p = theme::palette(ctx);
+        let now = Instant::now();
+        let undo = self.pending.last().map(|x| x.label.clone());
+        let info = match self.toast_at {
+            Some(t) if now.duration_since(t) < TOAST_FOR && !self.toast_text.is_empty() => Some(self.toast_text.clone()),
+            _ => None,
+        };
+        let Some(text) = undo.clone().or(info) else { return };
+        let r = egui::Area::new(Id::unique("toast")).order(Order::Foreground).anchor(Align2::LEFT_BOTTOM, egui::vec2(16.0, -16.0)).show(
             ctx,
             |ui| {
-                egui::Frame::popup(ui.style()).show(ui, |ui| {
-                    ui.horizontal(|ui| {
-                        ui.label(&label);
-                        if ui.button(format!("Undo ({left})")).on_hover_text("Ctrl+Z").clicked() {
-                            self.acts.push(Action::Undo);
-                        }
+                egui::Frame::new()
+                    .fill(p.inverse)
+                    .corner_radius(egui::CornerRadius::same(8))
+                    .shadow(ctx.global_style().visuals.popup_shadow)
+                    .inner_margin(egui::Margin { left: 16, right: 8, top: 6, bottom: 6 })
+                    .show(ui, |ui| {
+                        ui.set_max_width(480.0);
+                        ui.horizontal(|ui| {
+                            ui.add(egui::Label::new(RichText::new(&text).color(p.on_inverse)).wrap());
+                            let accent = if p.dark { theme::LIGHT.accent } else { theme::DARK.accent };
+                            if undo.is_some() {
+                                if ui
+                                    .add(egui::Button::new(RichText::new("Undo").font(theme::semibold(ty::UI)).color(accent)).frame(false))
+                                    .on_hover_text("Ctrl+Z")
+                                    .clicked()
+                                {
+                                    self.acts.push(Action::Undo);
+                                }
+                            } else if ui
+                                .add(egui::Button::new(kit::glyph(ic::ICON_CLOSE, 18.0, p.on_inverse)).frame(false))
+                                .on_hover_text("Dismiss")
+                                .clicked()
+                            {
+                                self.toast_at = None;
+                            }
+                        });
                     });
-                });
             },
         );
+        // Hovering keeps the toast (and the undo window) open.
+        if r.response.contains_pointer() {
+            for x in self.pending.iter_mut() {
+                x.deadline = x.deadline.max(now + Duration::from_secs(3));
+            }
+            if undo.is_none() {
+                self.toast_at = Some(now);
+            }
+        }
+        ctx.request_repaint_after(Duration::from_millis(500));
     }
 
+    /// Account health under its heading: quiet when fine, actionable when not.
     fn ui_account_status(ui: &mut egui::Ui, i: usize, a: &Acct, acts: &mut Vec<Action>) {
-        let small = |t: String| RichText::new(t).small();
-        ui.horizontal_wrapped(|ui| {
-            if a.cfg.paused {
-                ui.label(small("⏸ Paused".into()).weak());
-                if ui.small_button("Resume").clicked() {
+        let p = kit::pal(ui);
+        let line = |ui: &mut egui::Ui, icon, color, text: &str, tip: &str| {
+            ui.label(kit::glyph(icon, 16.0, color));
+            ui.label(RichText::new(text).size(ty::META).color(color)).on_hover_text(tip);
+        };
+        let link = |ui: &mut egui::Ui, text: &str| {
+            ui.add(egui::Button::new(RichText::new(text).size(ty::META).color(p.accent)).frame(false)).clicked()
+        };
+        if a.cfg.paused {
+            ui.horizontal(|ui| {
+                ui.add_space(10.0);
+                line(ui, ic::ICON_PAUSE, p.text_secondary, "Paused", "This account holds no connections while paused");
+                if link(ui, "Resume") {
                     acts.push(Action::Pause(i, false));
                 }
-                return;
-            }
-            match &a.state {
-                AcctState::Online => {
-                    let when = a.last_sync.map(ago).unwrap_or_else(|| "syncing…".into());
-                    let push = if a.push { " · push" } else { "" };
-                    ui.label(small(format!("● {when}{push}")).color(GOOD)).on_hover_text(if a.push {
-                        "Connected. New mail arrives instantly (IMAP IDLE)."
-                    } else {
-                        "Connected. Checking for new mail periodically."
-                    });
-                }
-                AcctState::Connecting => {
-                    ui.label(small("Connecting…".into()).weak());
-                }
-                AcctState::Offline(e) => {
-                    ui.label(small("⚠ Offline".into()).color(ui.visuals().warn_fg_color)).on_hover_text(e);
-                    if ui.small_button("Retry").clicked() {
+            });
+            return;
+        }
+        match &a.state {
+            AcctState::Offline(e) => {
+                ui.horizontal(|ui| {
+                    ui.add_space(10.0);
+                    line(ui, ic::ICON_CLOUD_OFF, p.warning, "Offline", e);
+                    if link(ui, "Retry") {
                         acts.push(Action::Retry(i));
                     }
-                }
-                AcctState::AuthFailed(e) => {
-                    ui.label(small("⚠ Sign-in failed".into()).color(ui.visuals().error_fg_color)).on_hover_text(e);
-                    if ui.small_button("Sign in again").clicked() {
+                });
+            }
+            AcctState::AuthFailed(e) => {
+                ui.horizontal(|ui| {
+                    ui.add_space(10.0);
+                    line(ui, ic::ICON_ERROR, p.error, "Sign-in failed", e);
+                    if link(ui, "Sign in again") {
                         acts.push(Action::EditAccount(i));
                     }
-                    if ui.small_button("Retry").clicked() {
-                        acts.push(Action::Retry(i));
-                    }
-                }
+                });
             }
-        });
+            AcctState::Online | AcctState::Connecting => {}
+        }
+    }
+
+    fn folder_icon(special: Option<Special>) -> egui_material_icons::MaterialIcon {
+        match special {
+            Some(Special::Inbox) => ic::ICON_INBOX,
+            Some(Special::Drafts) => ic::ICON_DRAFT,
+            Some(Special::Sent) => ic::ICON_SEND,
+            Some(Special::Archive) => ic::ICON_ARCHIVE,
+            Some(Special::All) => ic::ICON_ALL_INBOX,
+            Some(Special::Junk) => ic::ICON_REPORT,
+            Some(Special::Trash) => ic::ICON_DELETE,
+            None => ic::ICON_FOLDER,
+        }
     }
 
     fn ui_folders(&mut self, root: &mut egui::Ui) {
-        egui::Panel::left("folders").resizable(true).default_size(220.0).size_range(160.0..=360.0).show(root, |ui| {
-            egui::ScrollArea::vertical().auto_shrink([false, false]).show(ui, |ui| {
-                ui.add_space(6.0);
-                ui.with_layout(Layout::top_down_justified(Align::LEFT), |ui| {
+        let ctx = root.ctx().clone();
+        let p = theme::palette(&ctx);
+        let narrow = ctx.content_rect().width() < 1100.0;
+        if (narrow && !self.nav_drawer) || (!narrow && !self.nav_open) {
+            return;
+        }
+        egui::Panel::left("folders")
+            .resizable(true)
+            .default_size(224.0)
+            .size_range(180.0..=360.0)
+            .show_separator_line(false)
+            .frame(egui::Frame::new().fill(p.nav).inner_margin(egui::Margin { left: 8, right: 8, top: 4, bottom: 8 }))
+            .show(root, |ui| {
+                let mut acts = Vec::new();
+                egui::Panel::bottom("nav-footer")
+                    .show_separator_line(false)
+                    .frame(egui::Frame::new().fill(p.nav).inner_margin(egui::Margin::symmetric(0, 6)))
+                    .show(ui, |ui| {
+                        if kit::quiet_button(ui, Some(ic::ICON_PERSON_ADD), "Add account").clicked() {
+                            acts.push(Action::AddAccount);
+                        }
+                    });
+                ui.add_space(4.0);
+                if kit::primary_button(ui, Some(ic::ICON_EDIT), "New message").on_hover_text("New message (C)").clicked() {
+                    acts.push(Action::Compose);
+                }
+                ui.add_space(12.0);
+                egui::ScrollArea::vertical().auto_shrink([false, false]).show(ui, |ui| {
+                    ui.spacing_mut().item_spacing.y = 0.0;
                     let total: usize = self.accts.iter().filter(|a| a.live()).map(|a| a.unread(&a.inbox())).sum();
-                    let label = if total > 0 {
-                        RichText::new(format!("📥  All inboxes   {total}")).strong()
-                    } else {
-                        RichText::new("📥  All inboxes")
-                    };
-                    if ui.selectable_label(self.sel == Sel::Unified, label).clicked() {
-                        self.acts.push(Action::Select(Sel::Unified));
+                    if kit::nav_row(ui, ic::ICON_ALL_INBOX, "All inboxes", total, self.sel == Sel::Unified, 0.0, true).clicked() {
+                        acts.push(Action::Select(Sel::Unified));
                     }
                     if let Sel::Search(q) = &self.sel {
-                        let _ = ui.selectable_label(true, format!("🔍  \"{q}\""));
+                        let _ = kit::nav_row(ui, ic::ICON_SEARCH, &format!("“{q}”"), 0, true, 0.0, true);
                     }
-                    ui.add_space(6.0);
-                    let mut acts = Vec::new();
                     for (i, a) in self.accts.iter().enumerate().filter(|(_, a)| a.live()) {
-                        let color = ACCOUNT_COLORS[i % ACCOUNT_COLORS.len()];
-                        let head = egui::CollapsingHeader::new(RichText::new(format!("●  {}", a.cfg.label())).color(color).strong())
-                            .id_salt(("acct", &a.cfg.id))
-                            .default_open(true)
-                            .show(ui, |ui| {
-                                Self::ui_account_status(ui, i, a, &mut acts);
-                                if a.folders.is_empty() {
-                                    ui.label(RichText::new("No folders yet").weak().small());
-                                }
-                                for f in &a.folders {
-                                    let indent = "      ".repeat(f.depth);
-                                    let icon = f.special.map(|s| s.icon()).unwrap_or("📁");
-                                    let unread = a.unread(&f.name);
-                                    let show_unread = unread > 0
-                                        && !matches!(
-                                            f.special,
-                                            Some(Special::Trash | Special::Junk | Special::Sent | Special::All | Special::Drafts)
-                                        );
-                                    let text = if show_unread {
-                                        RichText::new(format!("{indent}{icon}  {}   {unread}", f.display)).strong()
-                                    } else {
-                                        RichText::new(format!("{indent}{icon}  {}", f.display))
-                                    };
-                                    if !f.selectable {
-                                        ui.label(text.weak());
-                                        continue;
-                                    }
-                                    let selected = self.sel == Sel::Folder(i, f.name.clone());
-                                    if ui.selectable_label(selected, text).clicked() {
-                                        acts.push(Action::Select(Sel::Folder(i, f.name.clone())));
-                                    }
-                                }
-                            });
+                        ui.add_space(14.0);
+                        let id = Id::unique(("acct-open", &a.cfg.id));
+                        let open = ctx.data(|d| d.get_temp::<bool>(id)).unwrap_or(true);
                         let paused = a.cfg.paused;
-                        head.header_response.context_menu(|ui| {
-                            if ui.button("Edit account…").clicked() {
-                                acts.push(Action::EditAccount(i));
-                                ui.close();
+                        // Account heading: name, collapse, and an explicit overflow menu.
+                        ui.horizontal(|ui| {
+                            ui.set_height(28.0);
+                            let head = ui.add(
+                                egui::Button::new(
+                                    RichText::new(a.cfg.label()).font(theme::semibold(ty::META + 1.0)).color(p.text_secondary),
+                                )
+                                .frame(false),
+                            );
+                            if head.clicked() {
+                                ctx.data_mut(|d| d.insert_temp(id, !open));
                             }
-                            if ui.button(if paused { "Resume" } else { "Pause" }).clicked() {
-                                acts.push(Action::Pause(i, !paused));
-                                ui.close();
-                            }
-                            if ui.button("Remove account…").clicked() {
-                                acts.push(Action::RemoveAccount(i));
-                                ui.close();
-                            }
+                            ui.label(kit::glyph(if open { ic::ICON_EXPAND_LESS } else { ic::ICON_EXPAND_MORE }, 16.0, p.text_disabled));
+                            ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                                ui.menu_button(kit::glyph(ic::ICON_MORE_VERT, 18.0, p.text_secondary), |ui| {
+                                    if ui.button("Account settings…").clicked() {
+                                        acts.push(Action::EditAccount(i));
+                                        ui.close();
+                                    }
+                                    if ui.button(if paused { "Resume syncing" } else { "Pause syncing" }).clicked() {
+                                        acts.push(Action::Pause(i, !paused));
+                                        ui.close();
+                                    }
+                                    if ui.button("Remove account…").clicked() {
+                                        acts.push(Action::RemoveAccount(i));
+                                        ui.close();
+                                    }
+                                })
+                                .response
+                                .on_hover_text("Account options");
+                            });
                         });
+                        Self::ui_account_status(ui, i, a, &mut acts);
+                        if !open {
+                            continue;
+                        }
+                        if a.folders.is_empty() {
+                            ui.label(RichText::new("Loading folders…").size(ty::META).color(p.text_secondary));
+                        }
+                        for f in &a.folders {
+                            let unread = a.unread(&f.name);
+                            let show_unread =
+                                !matches!(f.special, Some(Special::Trash | Special::Junk | Special::Sent | Special::All | Special::Drafts));
+                            let selected = self.sel == Sel::Folder(i, f.name.clone());
+                            let r = kit::nav_row(
+                                ui,
+                                Self::folder_icon(f.special),
+                                &f.display,
+                                if show_unread { unread } else { 0 },
+                                selected,
+                                f.depth as f32 * 16.0,
+                                f.selectable,
+                            );
+                            if f.selectable && r.clicked() {
+                                acts.push(Action::Select(Sel::Folder(i, f.name.clone())));
+                            }
+                        }
                     }
-                    self.acts.extend(acts);
                 });
+                self.acts.extend(acts);
             });
-        });
     }
 
     fn ui_list(&mut self, root: &mut egui::Ui) {
-        let ctx = &root.ctx().clone();
+        let ctx = root.ctx().clone();
+        let p = theme::palette(&ctx);
+        let compact = self.cfg.settings.compact;
+        let row_h = if compact { ROW_H_COMPACT } else { ROW_H };
         egui::Panel::left("list")
             .resizable(true)
-            .default_size(380.0)
-            .size_range(260.0..=700.0)
-            .frame(egui::Frame::side_top_panel(&ctx.global_style()).inner_margin(egui::Margin::symmetric(0, 6)))
+            .default_size(360.0)
+            .size_range(320.0..=700.0)
+            .show_separator_line(true)
+            .frame(egui::Frame::new().fill(p.surface))
             .show(root, |ui| {
-                ui.horizontal(|ui| {
-                    ui.add_space(12.0);
-                    let (title, more) = match &self.sel {
-                        Sel::Unified => (
-                            "All inboxes".to_string(),
-                            self.accts
-                                .iter()
-                                .filter(|a| a.live())
-                                .any(|a| a.idx.get(&a.inbox()).is_some_and(|i| (i.msgs.len() as u32) < i.exists)),
-                        ),
-                        Sel::Folder(i, f) => {
-                            let a = &self.accts[*i];
-                            (a.folder_display(f), a.idx.get(f).is_some_and(|x| (x.msgs.len() as u32) < x.exists))
-                        }
-                        Sel::Search(q) => (format!("Results for \"{q}\""), false),
-                    };
-                    ui.label(RichText::new(title).strong().size(16.0));
-                    ui.label(RichText::new(format!("{}", self.rows.len())).weak());
-                    ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
-                        ui.add_space(10.0);
-                        if let Sel::Search(_) = &self.sel {
-                            if ui.small_button("✖ Close").on_hover_text("Esc in the search box").clicked() {
-                                self.acts.push(Action::Select(Sel::Unified));
+                // Header: folder title and count, or the bulk-action bar when several are selected.
+                let header = Rect::from_min_size(ui.cursor().min, egui::vec2(ui.available_width(), 52.0));
+                ui.scope_builder(egui::UiBuilder::new().max_rect(header.shrink2(egui::vec2(16.0, 0.0))), |ui| {
+                    ui.horizontal_centered(|ui| {
+                        if self.selection.len() > 1 {
+                            let keys: Vec<Key> = self.selection.iter().cloned().collect();
+                            if kit::icon_button(ui, ic::ICON_CLOSE, "Clear selection (Esc)").clicked() {
+                                self.selection.clear();
                             }
-                            if self.accts.iter().any(|a| a.search.as_ref().is_some_and(|s| s.loading)) {
-                                ui.spinner();
-                            }
-                        } else if more && ui.small_button("Load older").clicked() {
-                            self.acts.push(Action::LoadMore);
+                            ui.label(RichText::new(format!("{} selected", keys.len())).font(theme::semibold(ty::UI)).color(p.text));
+                            ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                                if kit::icon_button(ui, ic::ICON_MARK_EMAIL_UNREAD, "Mark as unread").clicked() {
+                                    self.acts.push(Action::Flag(keys.clone(), MsgFlag::Seen, false));
+                                }
+                                if kit::icon_button(ui, ic::ICON_DRAFTS, "Mark as read").clicked() {
+                                    self.acts.push(Action::Flag(keys.clone(), MsgFlag::Seen, true));
+                                }
+                                if kit::icon_button(ui, ic::ICON_DELETE, "Delete").clicked() {
+                                    self.acts.push(Action::Trash(keys.clone()));
+                                    self.selection.clear();
+                                }
+                                if kit::icon_button(ui, ic::ICON_ARCHIVE, "Archive").clicked() {
+                                    self.acts.push(Action::Archive(keys.clone()));
+                                    self.selection.clear();
+                                }
+                            });
+                            return;
                         }
+                        let title = match &self.sel {
+                            Sel::Unified => "All inboxes".to_string(),
+                            Sel::Folder(i, f) => self.accts[*i].folder_display(f),
+                            Sel::Search(q) => format!("Results for “{q}”"),
+                        };
+                        ui.label(RichText::new(title).font(theme::semibold(ty::HEADING)).color(p.text));
+                        ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                            if let Sel::Search(_) = &self.sel {
+                                if kit::icon_button(ui, ic::ICON_CLOSE, "Close search (Esc)").clicked() {
+                                    self.acts.push(Action::Select(Sel::Unified));
+                                }
+                                if self.accts.iter().any(|a| a.search.as_ref().is_some_and(|s| s.loading)) {
+                                    ui.add(egui::Spinner::new().size(16.0).color(p.text_secondary));
+                                }
+                            } else if !self.rows.is_empty() {
+                                ui.label(RichText::new(format!("{}", self.rows.len())).size(ty::META).color(p.text_secondary));
+                            }
+                        });
                     });
                 });
+                ui.advance_cursor_after_rect(header);
                 if let Sel::Search(_) = &self.sel {
                     let scopes: Vec<String> = self
                         .accts
                         .iter()
                         .filter_map(|a| a.search.as_ref().map(|s| (a, s)))
                         .map(|(a, s)| {
-                            let trunc = if s.total > s.msgs.len() {
-                                format!(" · newest {} of {} matches", s.msgs.len(), s.total)
-                            } else {
-                                String::new()
-                            };
-                            format!("{} / {}{trunc}", a.cfg.label(), a.folder_display(&s.folder))
+                            let trunc =
+                                if s.total > s.msgs.len() { format!(" · newest {} of {}", s.msgs.len(), s.total) } else { String::new() };
+                            format!("{} › {}{trunc}", a.cfg.label(), a.folder_display(&s.folder))
                         })
                         .collect();
                     ui.horizontal(|ui| {
-                        ui.add_space(12.0);
-                        ui.label(RichText::new(format!("In {}", scopes.join("; "))).small().weak());
-                    });
-                }
-                ui.add_space(4.0);
-                ui.separator();
-
-                if self.rows.is_empty() {
-                    ui.add_space(30.0);
-                    ui.vertical_centered(|ui| {
-                        let busy = self.accts.iter().any(|a| a.busy);
-                        ui.label(
-                            RichText::new(if self.live_count() == 0 {
-                                "No accounts yet"
-                            } else if busy {
-                                "Loading…"
-                            } else if !self.filter.is_empty() && !matches!(self.sel, Sel::Search(_)) {
-                                "Nothing matches the filter. Press Enter to search the server."
-                            } else {
-                                "No messages"
-                            })
-                            .weak(),
+                        ui.add_space(16.0);
+                        ui.add(
+                            egui::Label::new(
+                                RichText::new(format!("Searched {}", scopes.join("; "))).size(ty::META).color(p.text_secondary),
+                            )
+                            .wrap(),
                         );
                     });
+                    ui.add_space(6.0);
+                } else if !self.filter.trim().is_empty() {
+                    ui.horizontal(|ui| {
+                        ui.add_space(16.0);
+                        ui.label(
+                            RichText::new("Filtering downloaded messages · press Enter to search the server")
+                                .size(ty::META)
+                                .color(p.text_secondary),
+                        );
+                    });
+                    ui.add_space(6.0);
+                }
+                let r = ui.available_rect_before_wrap();
+                ui.painter().hline(r.x_range(), r.top(), Stroke::new(1.0, p.divider));
+
+                if self.rows.is_empty() {
+                    let busy = self.accts.iter().any(|a| a.busy || a.search.as_ref().is_some_and(|s| s.loading));
+                    let (icon, title, detail, action) = if self.live_count() == 0 {
+                        (ic::ICON_PERSON_ADD, "No accounts yet", "Add an email account to get started.", Some("Add account"))
+                    } else if busy {
+                        (ic::ICON_SYNC, "Loading messages…", "", None)
+                    } else if matches!(self.sel, Sel::Search(_)) {
+                        (ic::ICON_SEARCH, "No results", "Try different words, or search all inboxes.", None)
+                    } else if !self.filter.trim().is_empty() {
+                        (ic::ICON_SEARCH, "No downloaded messages match", "Press Enter to search the server.", None)
+                    } else {
+                        (ic::ICON_INBOX, "Nothing here", "This folder is empty.", None)
+                    };
+                    if kit::empty_state(ui, icon, title, detail, action) {
+                        self.acts.push(Action::AddAccount);
+                    }
                     return;
                 }
 
@@ -2458,27 +2797,67 @@ impl App {
                 let mut sa = egui::ScrollArea::vertical().auto_shrink([false, false]).id_salt("list");
                 if self.scroll_to_cur {
                     self.scroll_to_cur = false;
-                    if let Some(p) = self.cur.as_ref().and_then(|c| self.rows.iter().position(|r| &r.key == c)) {
-                        let y = p as f32 * ROW_H;
+                    if let Some(pos) = self.cur.as_ref().and_then(|c| self.rows.iter().position(|r| &r.key == c)) {
+                        let y = pos as f32 * row_h;
                         let (off, h) = self.list_scroll;
                         if y < off {
                             sa = sa.vertical_scroll_offset(y);
-                        } else if y + ROW_H > off + h {
-                            sa = sa.vertical_scroll_offset(y + ROW_H - h);
+                        } else if y + row_h > off + h {
+                            sa = sa.vertical_scroll_offset(y + row_h - h);
                         }
                     }
                 }
-                let multi = self.live_count() > 1;
+                let multi = self.live_count() > 1 && self.sel != Sel::Folder(0, String::new());
+                let mods = ctx.input(|i| i.modifiers);
                 let mut acts = Vec::new();
-                let out = sa.show_rows(ui, ROW_H, self.rows.len(), |ui, range| {
+                let mut clicked_row: Option<(usize, bool, bool)> = None;
+                let more = match &self.sel {
+                    Sel::Unified => self
+                        .accts
+                        .iter()
+                        .filter(|a| a.live())
+                        .any(|a| a.idx.get(&a.inbox()).is_some_and(|i| (i.msgs.len() as u32) < i.exists)),
+                    Sel::Folder(i, f) => self.accts[*i].idx.get(f).is_some_and(|x| (x.msgs.len() as u32) < x.exists),
+                    Sel::Search(_) => false,
+                };
+                let n = self.rows.len() + usize::from(more);
+                let out = sa.show_rows(ui, row_h, n, |ui, range| {
                     for i in range {
+                        if i == self.rows.len() {
+                            // Last row: load older messages.
+                            ui.allocate_ui(egui::vec2(ui.available_width(), row_h), |ui| {
+                                ui.centered_and_justified(|ui| {
+                                    if kit::quiet_button(ui, Some(ic::ICON_EXPAND_MORE), "Load older messages").clicked() {
+                                        acts.push(Action::LoadMore);
+                                    }
+                                });
+                            });
+                            continue;
+                        }
                         let r = &self.rows[i];
-                        let selected = self.cur.as_ref() == Some(&r.key);
-                        let stripe = multi.then(|| ACCOUNT_COLORS[r.key.acct % ACCOUNT_COLORS.len()]);
                         let a = &self.accts[r.key.acct];
-                        let resp = paint_row(ui, r, selected, stripe, self.bold, if multi { a.cfg.label() } else { "" });
-                        if resp.clicked() {
-                            acts.push(Action::Open(r.key.clone()));
+                        let st = RowState {
+                            selected: self.cur.as_ref() == Some(&r.key),
+                            checked: self.selection.contains(&r.key),
+                            compact,
+                            acct_label: if multi && !matches!(self.sel, Sel::Folder(..)) {
+                                a.cfg.label().to_string()
+                            } else {
+                                String::new()
+                            },
+                        };
+                        let (resp, act) = paint_row(ui, r, &st);
+                        let keys = vec![r.key.clone()];
+                        match act {
+                            Some(RowAct::Archive) => acts.push(Action::Archive(keys.clone())),
+                            Some(RowAct::Delete) => acts.push(Action::Trash(keys.clone())),
+                            Some(RowAct::ToggleRead) => acts.push(Action::Flag(keys.clone(), MsgFlag::Seen, !r.s.seen)),
+                            Some(RowAct::ToggleStar) => acts.push(Action::Flag(keys.clone(), MsgFlag::Flagged, !r.s.flagged)),
+                            None => {
+                                if resp.clicked() {
+                                    clicked_row = Some((i, mods.command, mods.shift));
+                                }
+                            }
                         }
                         let key = r.key.clone();
                         let (seen, flagged) = (r.s.seen, r.s.flagged);
@@ -2513,6 +2892,29 @@ impl App {
                         });
                     }
                 });
+                // Click: open. Ctrl+click: toggle in selection. Shift+click: select a range.
+                if let Some((i, ctrl, shift)) = clicked_row {
+                    let key = self.rows[i].key.clone();
+                    if shift {
+                        let a = self.sel_anchor.unwrap_or(i);
+                        let (lo, hi) = (a.min(i), a.max(i));
+                        self.selection = self.rows[lo..=hi].iter().map(|r| r.key.clone()).collect();
+                    } else if ctrl {
+                        if self.selection.is_empty() {
+                            if let Some(c) = self.cur.clone() {
+                                self.selection.insert(c);
+                            }
+                        }
+                        if !self.selection.remove(&key) {
+                            self.selection.insert(key);
+                        }
+                        self.sel_anchor = Some(i);
+                    } else {
+                        self.selection.clear();
+                        self.sel_anchor = Some(i);
+                        acts.push(Action::Open(key));
+                    }
+                }
                 self.acts.extend(acts);
                 self.list_scroll = (out.state.clamped_offset().y, out.inner_rect.height());
             });
@@ -2529,42 +2931,49 @@ impl App {
 
     fn ui_reader(&mut self, root: &mut egui::Ui) {
         let ctx = &root.ctx().clone();
+        let p = theme::palette(ctx);
         let html_ok = self.html_supported();
         let mut html_target: Option<(Rect, u64)> = None;
         let mut want_previews: Vec<mail_parser::PartId> = Vec::new();
         egui::CentralPanel::default()
-            .frame(egui::Frame::central_panel(&ctx.global_style()).inner_margin(egui::Margin::symmetric(20, 12)))
+            .frame(egui::Frame::new().fill(p.surface).inner_margin(egui::Margin { left: 24, right: 24, top: 8, bottom: 0 }))
             .show(root, |ui| {
                 if self.live_count() == 0 {
-                    ui.vertical_centered(|ui| {
-                        ui.add_space(ui.available_height() * 0.3);
-                        ui.heading("Welcome to Mail");
-                        ui.label(RichText::new("Fast, minimal, and it never touches your messages.").weak());
-                        ui.add_space(12.0);
-                        if ui.button("Add an account").clicked() {
-                            self.acts.push(Action::AddAccount);
-                        }
-                    });
+                    if kit::empty_state(ui, ic::ICON_MAIL, "Welcome to Mail", "Add an email account to get started.", Some("Add account")) {
+                        self.acts.push(Action::AddAccount);
+                    }
                     return;
                 }
                 let Some(key) = self.cur.clone() else {
-                    ui.centered_and_justified(|ui| ui.label(RichText::new("No message selected").weak()));
+                    let detail = if self.selection.len() > 1 {
+                        "Use the actions above the list for the selected messages."
+                    } else {
+                        "Choose a message to read it here."
+                    };
+                    let title = if self.selection.len() > 1 {
+                        format!("{} messages selected", self.selection.len())
+                    } else {
+                        "No message selected".into()
+                    };
+                    kit::empty_state(ui, ic::ICON_MAIL, &title, detail, None);
                     return;
                 };
                 if self.loading.is_some() {
-                    ui.centered_and_justified(|ui| ui.spinner());
+                    ui.centered_and_justified(|ui| ui.add(egui::Spinner::new().size(24.0).color(p.text_secondary)));
                     return;
                 }
-                if let Some(e) = &self.view_error {
-                    ui.centered_and_justified(|ui| {
-                        ui.label(RichText::new(format!("Could not load message: {e}")).color(ui.visuals().error_fg_color))
-                    });
+                if let Some(e) = self.view_error.clone() {
+                    if kit::empty_state(ui, ic::ICON_ERROR, "Couldn't load this message", &e, Some("Try again")) {
+                        self.view_error = None;
+                        self.acts.push(Action::Open(key));
+                    }
                     return;
                 }
                 let nested = self.nested.len();
                 let Some(v) = self.nested.last().or(self.view.as_ref()) else { return };
                 let s = self.rows.iter().find(|r| r.key == key).map(|r| r.s.clone()).unwrap_or_default();
-                let in_drafts = self.accts[key.acct].folder_special(&key.folder) == Some(Special::Drafts);
+                let acct = &self.accts[key.acct];
+                let in_drafts = acct.folder_special(&key.folder) == Some(Special::Drafts);
                 let keys = vec![key.clone()];
                 let mut want_html = !self.cfg.settings.prefer_plain_text;
                 if self.text_toggle.contains(&key) {
@@ -2573,216 +2982,344 @@ impl App {
                 let html_mode = want_html && html_ok && v.html.is_some();
                 let allow_remote = self.cfg.settings.load_remote_content || self.remote_ok.contains(&key);
 
-                ui.horizontal_wrapped(|ui| {
+                // ---- Toolbar
+                ui.horizontal(|ui| {
+                    ui.set_height(40.0);
                     if nested > 0 {
-                        if ui.button("← Back").on_hover_text("Return to the message this was attached to").clicked() {
-                            self.acts.push(Action::Back);
-                        }
-                        ui.label(RichText::new("Attached message").weak());
-                        ui.separator();
-                    } else {
-                        if in_drafts {
-                            if ui.button("✏ Edit draft").clicked() {
-                                self.acts.push(Action::EditAsNew(true));
-                            }
-                            ui.separator();
-                        }
-                        if ui.button("↩ Reply").on_hover_text("R").clicked() {
-                            self.acts.push(Action::Reply(false));
-                        }
-                        if ui.button("↩ Reply all").on_hover_text("A").clicked() {
-                            self.acts.push(Action::Reply(true));
-                        }
-                        if ui.button("↪ Forward").on_hover_text("F").clicked() {
-                            self.acts.push(Action::Forward);
-                        }
-                        ui.separator();
-                        if ui.button("🗄").on_hover_text("Archive (E)").clicked() {
-                            self.acts.push(Action::Archive(keys.clone()));
-                        }
-                        if ui.button("🗑").on_hover_text("Delete (Del)").clicked() {
-                            self.acts.push(Action::Trash(keys.clone()));
-                        }
-                        if ui.button(if s.flagged { "★" } else { "☆" }).on_hover_text("Star (S)").clicked() {
-                            self.acts.push(Action::Flag(keys.clone(), MsgFlag::Flagged, !s.flagged));
-                        }
-                        if ui
-                            .button(if s.seen { "✉" } else { "✉•" })
-                            .on_hover_text(if s.seen { "Mark unread (U)" } else { "Mark read (U)" })
+                        if kit::quiet_button(ui, Some(ic::ICON_ARROW_BACK), "Back")
+                            .on_hover_text("Return to the message this was attached to")
                             .clicked()
                         {
-                            self.acts.push(Action::Flag(keys.clone(), MsgFlag::Seen, !s.seen));
+                            self.acts.push(Action::Back);
+                        }
+                        ui.label(RichText::new("Attached message").size(ty::META).color(p.text_secondary));
+                    } else {
+                        if in_drafts && kit::quiet_button(ui, Some(ic::ICON_EDIT), "Edit draft").clicked() {
+                            self.acts.push(Action::EditAsNew(true));
+                        }
+                        if kit::quiet_button(ui, Some(ic::ICON_REPLY), "Reply").on_hover_text("Reply (R)").clicked() {
+                            self.acts.push(Action::Reply(false));
+                        }
+                        if kit::quiet_button(ui, Some(ic::ICON_REPLY_ALL), "Reply all").on_hover_text("Reply all (A)").clicked() {
+                            self.acts.push(Action::Reply(true));
+                        }
+                        if kit::quiet_button(ui, Some(ic::ICON_FORWARD), "Forward").on_hover_text("Forward (F)").clicked() {
+                            self.acts.push(Action::Forward);
                         }
                     }
-                    ui.menu_button("⋯", |ui| {
-                        if v.html.is_some() {
-                            let label = if html_mode { "Show plain text" } else { "Show formatted (HTML)" };
-                            if ui.add_enabled(html_ok || html_mode, egui::Button::new(label)).clicked() {
-                                self.acts.push(Action::ToggleHtml(key.clone()));
+                    ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                        ui.menu_button(kit::glyph(ic::ICON_MORE_VERT, 20.0, p.text_secondary), |ui| {
+                            if v.html.is_some() {
+                                let label = if html_mode { "Show plain text" } else { "Show formatted (HTML)" };
+                                if ui.add_enabled(html_ok || html_mode, egui::Button::new(label)).clicked() {
+                                    self.acts.push(Action::ToggleHtml(key.clone()));
+                                    ui.close();
+                                }
+                            }
+                            if ui.button("View source").clicked() {
+                                self.acts.push(Action::ViewSource);
                                 ui.close();
                             }
+                            if ui.button("Save as .eml").on_hover_text("The original message, byte for byte").clicked() {
+                                self.acts.push(Action::SaveEml);
+                                ui.close();
+                            }
+                            if v.html.is_some() && ui.button("Open in browser").clicked() {
+                                self.acts.push(Action::OpenHtml);
+                                ui.close();
+                            }
+                            if nested == 0 && ui.button("Edit as new message").clicked() {
+                                self.acts.push(Action::EditAsNew(false));
+                                ui.close();
+                            }
+                            ui.separator();
+                            ui.checkbox(&mut self.mono, "Monospace plain text");
+                        })
+                        .response
+                        .on_hover_text("More");
+                        if nested == 0 {
+                            if kit::icon_button_ex(
+                                ui,
+                                ic::ICON_STAR,
+                                if s.flagged { "Unstar (S)" } else { "Star (S)" },
+                                s.flagged,
+                                s.flagged.then_some(p.warning),
+                            )
+                            .clicked()
+                            {
+                                self.acts.push(Action::Flag(keys.clone(), MsgFlag::Flagged, !s.flagged));
+                            }
+                            let (icon, tip) = if s.seen {
+                                (ic::ICON_MARK_EMAIL_UNREAD, "Mark as unread (U)")
+                            } else {
+                                (ic::ICON_DRAFTS, "Mark as read (U)")
+                            };
+                            if kit::icon_button(ui, icon, tip).clicked() {
+                                self.acts.push(Action::Flag(keys.clone(), MsgFlag::Seen, !s.seen));
+                            }
+                            ui.menu_button(kit::glyph(ic::ICON_DRIVE_FILE_MOVE, 20.0, p.text_secondary), |ui| {
+                                egui::ScrollArea::vertical().max_height(360.0).show(ui, |ui| {
+                                    for f in acct.folders.iter().filter(|f| f.selectable && f.name != key.folder) {
+                                        if ui.button(&f.display).clicked() {
+                                            self.acts.push(Action::MoveTo(keys.clone(), f.name.clone()));
+                                            ui.close();
+                                        }
+                                    }
+                                });
+                            })
+                            .response
+                            .on_hover_text("Move to");
+                            if kit::icon_button(ui, ic::ICON_DELETE, "Delete (Del)").clicked() {
+                                self.acts.push(Action::Trash(keys.clone()));
+                            }
+                            if kit::icon_button(ui, ic::ICON_ARCHIVE, "Archive (E)").clicked() {
+                                self.acts.push(Action::Archive(keys.clone()));
+                            }
                         }
-                        if ui.button("View source").clicked() {
-                            self.acts.push(Action::ViewSource);
-                            ui.close();
-                        }
-                        if ui.button("Save as .eml (original bytes)").clicked() {
-                            self.acts.push(Action::SaveEml);
-                            ui.close();
-                        }
-                        if v.html.is_some()
-                            && ui
-                                .button("Open HTML in browser")
-                                .on_hover_text("Remote images and trackers may load in the browser")
-                                .clicked()
-                        {
-                            self.acts.push(Action::OpenHtml);
-                            ui.close();
-                        }
-                        if nested == 0 && ui.button("Edit as new message").clicked() {
-                            self.acts.push(Action::EditAsNew(false));
-                            ui.close();
-                        }
-                        ui.checkbox(&mut self.mono, "Monospace plain text");
                     });
                 });
                 ui.add_space(8.0);
 
-                // Headers and attachments get a bounded area so long recipient
-                // lists or many attachments never push the body off screen.
-                let max_head = (ui.available_height() * 0.5).max(140.0);
+                // ---- Header (bounded, so long recipient lists never push the body away)
+                let max_head = (ui.available_height() * 0.7).max(200.0);
                 egui::ScrollArea::vertical()
                     .id_salt(("head", key.acct, &key.folder, key.uid, nested))
                     .max_height(max_head)
                     .auto_shrink([false, true])
                     .show(ui, |ui| {
-                        ui.add(egui::Label::new(RichText::new(&v.subject).size(20.0).strong()).wrap());
-                        ui.add_space(4.0);
-                        egui::Grid::new("hdrs").num_columns(2).spacing([10.0, 3.0]).show(ui, |ui| {
-                            let row = |ui: &mut egui::Ui, k: &str, val: &str| {
-                                if !val.is_empty() {
-                                    ui.label(RichText::new(k).weak());
-                                    ui.add(egui::Label::new(val).wrap());
-                                    ui.end_row();
-                                }
-                            };
-                            row(ui, "From", &v.from);
-                            row(ui, "To", &v.to);
-                            row(ui, "Cc", &v.cc);
-                            if !v.bcc_list.is_empty() {
-                                row(ui, "Bcc", &v.bcc_list.join(", "));
-                            }
-                            row(ui, "Date", &v.date);
-                        });
-                        if !v.unsubscribe.is_empty() {
-                            ui.horizontal(|ui| {
-                                ui.label(RichText::new("Mailing list").small().weak());
-                                if ui.small_button("Unsubscribe").on_hover_text(v.unsubscribe.join("\n")).clicked() {
-                                    self.acts.push(Action::Unsubscribe);
-                                }
-                            });
-                        }
-                        for n in &v.notices {
-                            ui.add(egui::Label::new(RichText::new(n.text()).small().color(ui.visuals().warn_fg_color)).wrap());
-                        }
-                        if let Some((inv, _)) = &v.invite {
-                            ui.add_space(6.0);
-                            egui::Frame::group(ui.style()).show(ui, |ui| {
-                                ui.set_width(ui.available_width());
-                                ui.label(RichText::new(format!("📅 {}", inv.headline())).small().color(ACCENT));
-                                ui.label(RichText::new(&inv.summary).strong().size(16.0));
-                                for (k, val) in [("When", &inv.when), ("Where", &inv.location), ("Organizer", &inv.organizer)] {
-                                    if !val.is_empty() {
-                                        ui.horizontal_wrapped(|ui| {
-                                            ui.label(RichText::new(k).weak());
-                                            ui.label(val.as_str());
-                                        });
-                                    }
-                                }
+                        ui.add(egui::Label::new(RichText::new(&v.subject).font(theme::semibold(ty::SUBJECT)).color(p.text)).wrap());
+                        ui.add_space(12.0);
+                        let (name, addr) = split_mailbox(&v.from);
+                        let details_id = Id::unique(("details", key.acct, &key.folder, key.uid));
+                        let details = ctx.data(|d| d.get_temp::<bool>(details_id)).unwrap_or(false);
+                        ui.horizontal(|ui| {
+                            kit::avatar(ui, if name.is_empty() { &addr } else { &name }, 36.0);
+                            ui.add_space(4.0);
+                            ui.vertical(|ui| {
+                                ui.spacing_mut().item_spacing.y = 2.0;
                                 ui.horizontal(|ui| {
-                                    if ui.button("Add to calendar").on_hover_text("Opens the invitation in your calendar app").clicked() {
-                                        self.acts.push(Action::AddToCalendar);
+                                    ui.label(
+                                        RichText::new(if name.is_empty() { &addr } else { &name })
+                                            .font(theme::semibold(ty::UI))
+                                            .color(p.text),
+                                    );
+                                    if !name.is_empty() {
+                                        ui.label(RichText::new(format!("<{addr}>")).size(ty::META + 1.0).color(p.text_secondary));
                                     }
-                                    if ui.button("Save .ics").clicked() {
-                                        self.acts.push(Action::SaveIcs);
+                                    if !v.unsubscribe.is_empty()
+                                        && ui
+                                            .add(
+                                                egui::Button::new(RichText::new("Unsubscribe").size(ty::META + 1.0).color(p.accent))
+                                                    .frame(false),
+                                            )
+                                            .on_hover_text(v.unsubscribe.join("\n"))
+                                            .clicked()
+                                    {
+                                        self.acts.push(Action::Unsubscribe);
+                                    }
+                                });
+                                let own = acct.cfg.own_addresses();
+                                let names: Vec<String> = v
+                                    .to_list
+                                    .iter()
+                                    .chain(&v.cc_list)
+                                    .map(|a| {
+                                        if own.contains(&compose::bare(a)) {
+                                            "me".to_string()
+                                        } else {
+                                            split_mailbox(a)
+                                                .0
+                                                .split(' ')
+                                                .next()
+                                                .filter(|n| !n.is_empty())
+                                                .map(String::from)
+                                                .unwrap_or_else(|| split_mailbox(a).1)
+                                        }
+                                    })
+                                    .collect();
+                                let summary = match names.len() {
+                                    0 => String::new(),
+                                    1..=3 => format!("to {}", names.join(", ")),
+                                    n => format!("to {}, {} +{}", names[0], names[1], n - 2),
+                                };
+                                ui.horizontal(|ui| {
+                                    ui.label(RichText::new(summary).size(ty::META + 1.0).color(p.text_secondary));
+                                    if ui
+                                        .add(
+                                            egui::Button::new(kit::glyph(
+                                                if details { ic::ICON_EXPAND_LESS } else { ic::ICON_EXPAND_MORE },
+                                                18.0,
+                                                p.text_secondary,
+                                            ))
+                                            .frame(false),
+                                        )
+                                        .on_hover_text("Show details")
+                                        .clicked()
+                                    {
+                                        ctx.data_mut(|d| d.insert_temp(details_id, !details));
                                     }
                                 });
                             });
-                        }
-                        if !v.attachments.is_empty() {
+                            ui.with_layout(Layout::right_to_left(Align::Min), |ui| {
+                                ui.label(RichText::new(&v.date).size(ty::META + 1.0).color(p.text_secondary));
+                            });
+                        });
+                        if details {
                             ui.add_space(6.0);
-                            ui.horizontal_wrapped(|ui| {
-                                for (i, a) in v.attachments.iter().enumerate() {
-                                    let icon = if a.is_message {
-                                        "✉"
-                                    } else if a.is_image {
-                                        "🖼"
-                                    } else {
-                                        "📎"
-                                    };
-                                    let hint = if a.is_message {
-                                        "Click to read · right-click for more"
-                                    } else {
-                                        "Click to save · right-click for more"
-                                    };
-                                    let r = ui
-                                        .button(format!("{icon} {}  ·  {}", a.name, model::fmt_size(a.size)))
-                                        .on_hover_text(format!("{}\n{hint}", a.mime));
-                                    if r.clicked() {
-                                        self.acts.push(if a.is_message { Action::OpenNested(i) } else { Action::SaveAttachment(i) });
+                            egui::Frame::new()
+                                .fill(p.window)
+                                .corner_radius(egui::CornerRadius::same(6))
+                                .inner_margin(egui::Margin::same(12))
+                                .show(ui, |ui| {
+                                    ui.set_width(ui.available_width());
+                                    egui::Grid::new("hdrs").num_columns(2).spacing([12.0, 4.0]).show(ui, |ui| {
+                                        let row = |ui: &mut egui::Ui, k: &str, val: &str| {
+                                            if !val.is_empty() {
+                                                ui.label(RichText::new(k).size(ty::META + 1.0).color(p.text_secondary));
+                                                ui.add(egui::Label::new(RichText::new(val).size(ty::META + 1.0).color(p.text)).wrap());
+                                                ui.end_row();
+                                            }
+                                        };
+                                        row(ui, "From", &v.from);
+                                        row(ui, "To", &v.to);
+                                        row(ui, "Cc", &v.cc);
+                                        if !v.bcc_list.is_empty() {
+                                            row(ui, "Bcc", &v.bcc_list.join(", "));
+                                        }
+                                        row(ui, "Date", &v.date);
+                                    });
+                                });
+                        }
+                        ui.add_space(12.0);
+                        for n in &v.notices {
+                            let tone = if matches!(n, crate::formats::Notice::Encrypted(_)) { Tone::Warning } else { Tone::Info };
+                            kit::notice(ui, tone, &n.text(), None);
+                            ui.add_space(6.0);
+                        }
+                        if let Some((inv, _)) = &v.invite {
+                            egui::Frame::new()
+                                .stroke(Stroke::new(1.0, p.divider))
+                                .corner_radius(egui::CornerRadius::same(8))
+                                .inner_margin(egui::Margin::same(16))
+                                .show(ui, |ui| {
+                                    ui.set_width(ui.available_width());
+                                    ui.horizontal(|ui| {
+                                        ui.label(kit::glyph(ic::ICON_CALENDAR_MONTH, 20.0, p.accent));
+                                        ui.label(RichText::new(inv.headline()).size(ty::META + 1.0).color(p.text_secondary));
+                                    });
+                                    ui.label(RichText::new(&inv.summary).font(theme::semibold(16.0)).color(p.text));
+                                    ui.add_space(4.0);
+                                    for (icon, val) in [
+                                        (ic::ICON_SCHEDULE, &inv.when),
+                                        (ic::ICON_LOCATION_ON, &inv.location),
+                                        (ic::ICON_PERSON, &inv.organizer),
+                                    ] {
+                                        if !val.is_empty() {
+                                            ui.horizontal(|ui| {
+                                                ui.label(kit::glyph(icon, 16.0, p.text_secondary));
+                                                ui.add(egui::Label::new(RichText::new(val.as_str()).color(p.text)).wrap());
+                                            });
+                                        }
                                     }
-                                    let is_message = a.is_message;
-                                    r.context_menu(|ui| {
-                                        if is_message && ui.button("Read in Mail").clicked() {
-                                            self.acts.push(Action::OpenNested(i));
-                                            ui.close();
+                                    ui.add_space(8.0);
+                                    ui.horizontal(|ui| {
+                                        if kit::secondary_button(ui, "Add to calendar")
+                                            .on_hover_text("Opens the invitation in your calendar app")
+                                            .clicked()
+                                        {
+                                            self.acts.push(Action::AddToCalendar);
                                         }
-                                        if !is_message && ui.button("Open").clicked() {
-                                            self.acts.push(Action::OpenAttachment(i));
-                                            ui.close();
-                                        }
-                                        if ui.button("Save as…").clicked() {
-                                            self.acts.push(Action::SaveAttachment(i));
-                                            ui.close();
+                                        if kit::quiet_button(ui, Some(ic::ICON_DOWNLOAD), "Save .ics").clicked() {
+                                            self.acts.push(Action::SaveIcs);
                                         }
                                     });
-                                }
-                            });
+                                });
+                            ui.add_space(8.0);
                         }
                         if html_mode && v.remote_content && !allow_remote {
-                            ui.add_space(4.0);
-                            ui.horizontal_wrapped(|ui| {
-                                ui.label(RichText::new("🛡 Remote images are blocked to protect your privacy.").small().weak());
-                                if ui
-                                    .small_button("Load remote content")
-                                    .on_hover_text("The sender may learn that you opened this message")
-                                    .clicked()
-                                {
-                                    self.acts.push(Action::AllowRemote(key.clone()));
-                                }
-                            });
+                            if kit::notice(ui, Tone::Info, "Remote images are blocked to protect your privacy.", Some("Load images")) {
+                                self.acts.push(Action::AllowRemote(key.clone()));
+                            }
+                            ui.add_space(8.0);
                         } else if !html_mode && v.html.is_some() {
-                            ui.add_space(4.0);
+                            let (text, action) = match &self.html_error {
+                                Some(e) if want_html => (format!("Shown as text: {e}."), Some("Open in browser")),
+                                _ if !html_ok => ("This message is shown as text.".to_string(), Some("Open in browser")),
+                                _ if v.from_html => {
+                                    ("This message only has an HTML version; it's shown as text.".to_string(), Some("Show formatted"))
+                                }
+                                _ => ("Shown as plain text.".to_string(), Some("Show formatted")),
+                            };
+                            if kit::notice(ui, Tone::Info, &text, action) {
+                                self.acts.push(if html_ok { Action::ToggleHtml(key.clone()) } else { Action::OpenHtml });
+                            }
+                            ui.add_space(8.0);
+                        }
+                        if !v.attachments.is_empty() {
                             ui.horizontal_wrapped(|ui| {
-                                let why = match &self.html_error {
-                                    Some(e) if want_html => format!("Shown as text: {e}."),
-                                    _ if !html_ok => "Shown as text.".to_string(),
-                                    _ if v.from_html => "HTML message shown as text.".to_string(),
-                                    _ => "Shown as plain text.".to_string(),
-                                };
-                                ui.label(RichText::new(format!("{why} Remote content is never loaded.")).small().weak());
-                                if html_ok {
-                                    if ui.small_button("Show formatted").clicked() {
-                                        self.acts.push(Action::ToggleHtml(key.clone()));
-                                    }
-                                } else if ui.small_button("Open original in browser").clicked() {
-                                    self.acts.push(Action::OpenHtml);
+                                ui.spacing_mut().item_spacing = egui::vec2(8.0, 8.0);
+                                for (i, a) in v.attachments.iter().enumerate() {
+                                    let icon = if a.is_message {
+                                        ic::ICON_MAIL
+                                    } else if a.is_image {
+                                        ic::ICON_IMAGE
+                                    } else if a.mime == "text/calendar" {
+                                        ic::ICON_CALENDAR_MONTH
+                                    } else {
+                                        ic::ICON_DESCRIPTION
+                                    };
+                                    egui::Frame::new()
+                                        .stroke(Stroke::new(1.0, p.divider))
+                                        .corner_radius(egui::CornerRadius::same(8))
+                                        .inner_margin(egui::Margin { left: 10, right: 4, top: 6, bottom: 6 })
+                                        .show(ui, |ui| {
+                                            ui.set_width(232.0);
+                                            ui.horizontal(|ui| {
+                                                ui.label(kit::glyph(icon, 22.0, p.text_secondary));
+                                                ui.vertical(|ui| {
+                                                    ui.spacing_mut().item_spacing.y = 0.0;
+                                                    ui.set_width(130.0);
+                                                    let g =
+                                                        kit::one_line(ui, a.name.clone(), theme::semibold(ty::META + 1.0), p.text, 130.0);
+                                                    ui.label(g).on_hover_text(&a.name);
+                                                    ui.label(
+                                                        RichText::new(format!(
+                                                            "{} · {}",
+                                                            file_kind(&a.name, &a.mime),
+                                                            model::fmt_size(a.size)
+                                                        ))
+                                                        .size(ty::META)
+                                                        .color(p.text_secondary),
+                                                    );
+                                                });
+                                                ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                                                    ui.spacing_mut().item_spacing.x = 0.0;
+                                                    if kit::icon_button(ui, ic::ICON_DOWNLOAD, "Save").clicked() {
+                                                        self.acts.push(Action::SaveAttachment(i));
+                                                    }
+                                                    let (oi, ot) = if a.is_message {
+                                                        (ic::ICON_MAIL, "Read in Mail")
+                                                    } else {
+                                                        (ic::ICON_OPEN_IN_NEW, "Open")
+                                                    };
+                                                    if kit::icon_button(ui, oi, ot).clicked() {
+                                                        self.acts.push(if a.is_message {
+                                                            Action::OpenNested(i)
+                                                        } else {
+                                                            Action::OpenAttachment(i)
+                                                        });
+                                                    }
+                                                });
+                                            });
+                                        });
                                 }
                             });
+                            ui.add_space(8.0);
                         }
                     });
-                ui.add_space(6.0);
-                ui.separator();
+                let r = ui.available_rect_before_wrap();
+                ui.painter().hline(r.x_range(), r.top(), Stroke::new(1.0, p.divider));
+                ui.add_space(1.0);
 
                 if html_mode {
                     // The native web view is placed over this area after the frame is laid out.
@@ -2799,20 +3336,20 @@ impl App {
                 egui::ScrollArea::vertical().id_salt(("body", key.acct, &key.folder, key.uid, nested)).auto_shrink([false, false]).show(
                     ui,
                     |ui| {
-                        ui.add_space(6.0);
+                        ui.add_space(16.0);
                         ui.spacing_mut().item_spacing = egui::vec2(0.0, 0.0);
-                        let font = if mono { FontId::monospace(13.0) } else { FontId::proportional(14.5) };
+                        let font = if mono { FontId::monospace(ty::MONO) } else { theme::regular(ty::BODY) };
                         for b in &v.blocks {
                             match b {
                                 Block::Text(t) => {
-                                    ui.add(egui::Label::new(RichText::new(t).font(font.clone())).wrap().selectable(true));
+                                    ui.add(egui::Label::new(RichText::new(t).font(font.clone()).color(p.text)).wrap().selectable(true));
                                 }
                                 Block::Line(segs) => {
                                     ui.horizontal_wrapped(|ui| {
                                         for (link, s) in segs {
                                             let rt = RichText::new(s).font(font.clone());
                                             if !*link {
-                                                ui.add(egui::Label::new(rt).wrap().selectable(true));
+                                                ui.add(egui::Label::new(rt.color(p.text)).wrap().selectable(true));
                                             } else if s.starts_with("mailto:") {
                                                 if ui.link(rt).clicked() {
                                                     self.acts.push(Action::ComposeTo(s.clone()));
@@ -2825,34 +3362,30 @@ impl App {
                                 }
                             }
                         }
-                        // Image attachments are previewed below the text.
+                        // Image attachments are previewed below the text, at their own size at most.
                         ui.spacing_mut().item_spacing = egui::vec2(8.0, 8.0);
                         for (i, a) in v.attachments.iter().enumerate().filter(|(_, a)| a.is_image) {
-                            ui.add_space(12.0);
+                            ui.add_space(16.0);
                             match self.previews.get(&(self.view_seq, a.part)) {
                                 Some(Preview::Ready(tex)) => {
-                                    let max_w = ui.available_width().min(640.0);
+                                    let natural = tex.size_vec2();
+                                    let max_w = ui.available_width().min(640.0).min(natural.x);
+                                    let size = natural * (max_w / natural.x).min(1.0);
                                     let r = ui
-                                        .add(
-                                            egui::Image::new(tex)
-                                                .fit_to_original_size(1.0)
-                                                .max_width(max_w)
-                                                .corner_radius(4.0)
-                                                .sense(Sense::click()),
-                                        )
+                                        .add(egui::Image::new(tex).fit_to_exact_size(size).corner_radius(6.0).sense(Sense::click()))
                                         .on_hover_text(format!("{} · click to open", a.name));
                                     if r.clicked() {
                                         self.acts.push(Action::OpenAttachment(i));
                                     }
                                 }
                                 Some(Preview::Loading) => {
-                                    ui.spinner();
+                                    ui.add(egui::Spinner::new().color(p.text_secondary));
                                 }
                                 Some(Preview::Failed) => {}
                                 None => want_previews.push(a.part),
                             }
                         }
-                        ui.add_space(24.0);
+                        ui.add_space(32.0);
                     },
                 );
             });
@@ -2869,7 +3402,9 @@ impl App {
         let (tx, ctx) = (self.tx.clone(), self.ctx.clone());
         std::thread::spawn(move || {
             let image = view::part_bytes(&raw, part).and_then(|b| image::load_from_memory(&b).ok()).map(|img| {
-                let img = img.thumbnail(1400, 1400).to_rgba8();
+                // Only ever shrink: `thumbnail` would scale small images up to the bound.
+                let img = if img.width() > 1400 || img.height() > 1400 { img.thumbnail(1400, 1400) } else { img };
+                let img = img.to_rgba8();
                 egui::ColorImage::from_rgba_unmultiplied([img.width() as usize, img.height() as usize], img.as_raw())
             });
             let _ = tx.send(Event { acct: String::new(), gen: 0, kind: Ev::Preview { seq, part, image } });
@@ -2990,40 +3525,37 @@ impl App {
             cids: v.cids.clone(),
             allow_remote,
         });
-        // Native child windows draw above egui, so shrink to the largest
-        // uncovered part when a window or menu overlaps, or hide if too little is left.
-        let covers: Vec<Rect> = ctx.memory(|m| {
+        // Native child windows draw above egui. Never resize the view for
+        // overlapping windows, menus or tooltips (that reflows the email);
+        // cut them out of the view instead.
+        let ppp = ctx.pixels_per_point();
+        let holes: Vec<(i32, i32, i32, i32)> = ctx.memory(|m| {
             m.areas()
                 .visible_layer_ids()
                 .into_iter()
-                .filter(|l| matches!(l.order, Order::Middle | Order::Foreground))
+                .filter(|l| matches!(l.order, Order::Middle | Order::Foreground | Order::Tooltip))
                 .filter_map(|l| m.area_rect(l.id))
-                .filter(|r| r.intersects(rect))
+                .filter_map(|r| {
+                    let r = r.expand(1.0).intersect(rect);
+                    r.is_positive().then(|| {
+                        let px = |v: f32, o: f32| ((v - o) * ppp).round() as i32;
+                        (px(r.min.x, rect.min.x), px(r.min.y, rect.min.y), px(r.max.x, rect.min.x), px(r.max.y, rect.min.y))
+                    })
+                })
                 .collect()
         });
-        let full = rect;
-        let mut rect = rect;
-        for c in covers {
-            if !c.intersects(rect) {
-                continue;
-            }
-            let options = [
-                Rect::from_min_max(rect.min, egui::pos2(c.left(), rect.bottom())),
-                Rect::from_min_max(egui::pos2(c.right(), rect.top()), rect.max),
-                Rect::from_min_max(rect.min, egui::pos2(rect.right(), c.top())),
-                Rect::from_min_max(egui::pos2(rect.left(), c.bottom()), rect.max),
-            ];
-            rect = options.into_iter().filter(|r| r.is_positive()).max_by(|a, b| a.area().total_cmp(&b.area())).unwrap_or(Rect::NOTHING);
-        }
-        let overlapped = !rect.is_positive() || rect.area() < full.area() * 0.25 || rect.width() < 200.0;
-        let ppp = ctx.pixels_per_point();
         hv.place(
             (rect.min.x * ppp).round() as i32,
             (rect.min.y * ppp).round() as i32,
             (rect.width() * ppp).round() as u32,
             (rect.height() * ppp).round() as u32,
         );
-        hv.set_visible(!overlapped && rect.width() > 8.0 && rect.height() > 8.0);
+        // Without window regions (macOS), hide rather than resize while something overlaps.
+        // Modal dialogs dim everything behind them, which a native view can't show: hide it.
+        let clip_supported = cfg!(windows);
+        let modal_open = self.settings_open || self.setup.is_some() || self.confirm.is_some() || self.quitting;
+        hv.set_visible(!modal_open && rect.width() > 8.0 && rect.height() > 8.0 && (clip_supported || holes.is_empty()));
+        hv.set_holes(holes);
     }
 
     #[cfg(not(any(windows, target_os = "macos")))]
@@ -3080,6 +3612,7 @@ impl App {
     }
 
     fn ui_composes(&mut self, ctx: &egui::Context) {
+        let p = theme::palette(ctx);
         // Ctrl+Enter is taken before any text field sees it, so nothing is
         // inserted into (or trimmed from) the message.
         if let Some(id) = self.focused_compose(ctx) {
@@ -3095,89 +3628,230 @@ impl App {
             .map(|(i, a)| (i, a.cfg.label().to_string(), a.cfg.identities()))
             .collect();
         let dropped: Vec<PathBuf> = ctx.input(|i| i.raw.dropped_files.iter().map(|f| f.path().to_path_buf()).collect());
-        let hovered_drop = ctx.input(|i| i.pointer.hover_pos());
+        let dragging_files = ctx.input(|i| !i.raw.hovered_files.is_empty());
+        let pointer = ctx.input(|i| i.pointer.hover_pos().or(i.pointer.latest_pos()));
+        let screen = ctx.content_rect();
+        // Docked composers sit bottom-right, side by side while they fit.
+        const W: f32 = 560.0;
+        const H: f32 = 520.0;
+        const TAB_W: f32 = 280.0;
+        let fit = (((screen.width() - 32.0) / (W + 12.0)).floor() as usize).max(1);
+        let n = self.composes.len();
         let mut acts = Vec::new();
         let mut drop_target: Option<u64> = None;
-        for c in self.composes.iter_mut() {
-            let mut open = true;
+        let mut right = screen.right() - 16.0;
+        for (idx, c) in self.composes.iter_mut().enumerate().rev() {
             let id = c.id;
+            let st_id = Id::unique(("compose-state", id));
+            // (minimised, expanded)
+            let (mut minimised, mut expanded) = ctx.data(|d| d.get_temp::<(bool, bool)>(st_id)).unwrap_or((false, false));
+            // Composers that don't fit are shown as tabs.
+            let forced_tab = !expanded && n - idx > fit;
+            let tab = minimised || forced_tab;
             let locked = c.sending || c.saving.is_some();
+            let (pos, size) = if expanded {
+                let sz = egui::vec2((screen.width() - 96.0).min(960.0), (screen.height() - 96.0).min(760.0));
+                (screen.center() - sz / 2.0, sz)
+            } else if tab {
+                let pos = egui::pos2(right - TAB_W, screen.bottom() - 44.0);
+                right -= TAB_W + 12.0;
+                (pos, egui::vec2(TAB_W, 44.0))
+            } else {
+                let h = H.min(screen.height() - 120.0);
+                let pos = egui::pos2(right - W, screen.bottom() - h - 16.0);
+                right -= W + 12.0;
+                (pos, egui::vec2(W, h))
+            };
+            let is_target = dragging_files && pointer.is_some_and(|ptr| Rect::from_min_size(pos, size).contains(ptr)) && !locked;
+            let frame = egui::Frame::new()
+                .fill(p.raised)
+                .stroke(Stroke::new(if is_target { 2.0 } else { 1.0 }, if is_target { p.accent } else { p.divider }))
+                .corner_radius(egui::CornerRadius::same(8))
+                .shadow(ctx.global_style().visuals.window_shadow);
             let resp = egui::Window::new(c.title())
                 .id(Id::unique(("compose", id)))
-                .open(&mut open)
-                .default_size([640.0, 520.0])
-                .min_width(420.0)
-                .resizable(true)
-                .collapsible(true)
+                .title_bar(false)
+                .frame(frame)
+                .current_pos(pos)
+                .fixed_size(size)
+                .resizable(false)
+                .movable(false)
                 .show(ctx, |ui| {
+                    ui.spacing_mut().item_spacing = egui::vec2(8.0, 0.0);
+                    // Header: title + minimise / expand / close.
+                    let (head_rect, head) = ui.allocate_exact_size(egui::vec2(ui.available_width(), 44.0), Sense::click());
+                    let title_w = (head_rect.width() - 3.0 * 32.0 - 40.0).max(40.0);
+                    let g = kit::one_line(ui, c.title(), theme::semibold(ty::UI), p.text, title_w);
+                    ui.painter().galley(egui::pos2(head_rect.left() + 16.0, head_rect.center().y - g.size().y / 2.0), g, p.text);
+                    let btns = Rect::from_min_max(
+                        egui::pos2(head_rect.right() - 3.0 * 32.0 - 8.0, head_rect.top() + 6.0),
+                        egui::pos2(head_rect.right() - 8.0, head_rect.bottom() - 6.0),
+                    );
+                    let toggled = ui
+                        .scope_builder(egui::UiBuilder::new().max_rect(btns).layout(Layout::left_to_right(Align::Center)), |ui| {
+                            ui.spacing_mut().item_spacing.x = 0.0;
+                            let mut toggled = None;
+                            if kit::icon_button(ui, ic::ICON_MINIMIZE, if tab { "Restore" } else { "Minimise" }).clicked() {
+                                toggled = Some((!tab, false));
+                            }
+                            if kit::icon_button(
+                                ui,
+                                if expanded { ic::ICON_CLOSE_FULLSCREEN } else { ic::ICON_OPEN_IN_FULL },
+                                if expanded { "Dock" } else { "Expand" },
+                            )
+                            .clicked()
+                            {
+                                toggled = Some((false, !expanded));
+                            }
+                            if kit::icon_button(ui, ic::ICON_CLOSE, "Close").clicked() {
+                                acts.push(Action::RequestClose(id));
+                            }
+                            toggled
+                        })
+                        .inner
+                        .or_else(|| (head.clicked() && tab).then_some((false, false)));
+                    if let Some((m, e)) = toggled {
+                        minimised = m;
+                        expanded = e;
+                    }
+                    if tab {
+                        return;
+                    }
+                    let r = ui.available_rect_before_wrap();
+                    ui.painter().hline(r.x_range(), r.top(), Stroke::new(1.0, p.divider));
+
+                    let row = |ui: &mut egui::Ui, label: &str, add: &mut dyn FnMut(&mut egui::Ui)| {
+                        ui.horizontal(|ui| {
+                            ui.set_height(40.0);
+                            ui.add_space(16.0);
+                            ui.allocate_ui_with_layout(egui::vec2(56.0, 40.0), Layout::left_to_right(Align::Center), |ui| {
+                                ui.label(RichText::new(label).color(p.text_secondary));
+                            });
+                            add(ui);
+                        });
+                        let r = ui.available_rect_before_wrap();
+                        ui.painter().hline((r.left() + 16.0)..=(r.right() - 16.0), r.top(), Stroke::new(1.0, p.divider));
+                    };
                     ui.add_enabled_ui(!locked, |ui| {
-                        egui::Grid::new(("cgrid", id)).num_columns(2).spacing([8.0, 6.0]).show(ui, |ui| {
-                            ui.label("From");
-                            ui.horizontal(|ui| {
-                                let current = accts
-                                    .iter()
-                                    .find(|(i, _, _)| *i == c.acct)
-                                    .and_then(|(_, _, ids)| ids.get(c.from).or(ids.first()).cloned())
-                                    .unwrap_or_else(|| "Choose an account".into());
-                                egui::ComboBox::from_id_salt(("from", id))
-                                    .selected_text(current)
-                                    .width(ui.available_width() - 70.0)
-                                    .show_ui(ui, |ui| {
-                                        for (i, _, ids) in &accts {
-                                            for (k, ident) in ids.iter().enumerate() {
-                                                if ui.selectable_label(c.acct == *i && c.from == k, ident).clicked() {
-                                                    c.acct = *i;
-                                                    c.from = k;
-                                                }
+                        row(ui, "From", &mut |ui| {
+                            let current = accts
+                                .iter()
+                                .find(|(i, _, _)| *i == c.acct)
+                                .and_then(|(_, _, ids)| ids.get(c.from).or(ids.first()).cloned())
+                                .unwrap_or_else(|| "Choose an account".into());
+                            egui::ComboBox::from_id_salt(("from", id)).selected_text(current).width(ui.available_width() - 16.0).show_ui(
+                                ui,
+                                |ui| {
+                                    for (i, _, ids) in &accts {
+                                        for (k, ident) in ids.iter().enumerate() {
+                                            if ui.selectable_label(c.acct == *i && c.from == k, ident).clicked() {
+                                                c.acct = *i;
+                                                c.from = k;
                                             }
                                         }
-                                    });
-                                if !c.show_cc && ui.small_button("Cc/Bcc").clicked() {
-                                    c.show_cc = true;
-                                }
-                            });
-                            ui.end_row();
-                            let field = |ui: &mut egui::Ui, label: &str, val: &mut String, hint: &str, focus: bool| {
-                                ui.label(label);
-                                let r = ui.add(egui::TextEdit::singleline(val).hint_text(hint).desired_width(f32::INFINITY));
-                                if focus {
-                                    r.request_focus();
-                                }
-                                ui.end_row();
-                            };
-                            let focus_to = c.focus && c.to.is_empty();
-                            field(ui, "To", &mut c.to, "name@example.com, …", focus_to);
-                            if c.show_cc {
-                                field(ui, "Cc", &mut c.cc, "", false);
-                                field(ui, "Bcc", &mut c.bcc, "", false);
+                                    }
+                                },
+                            );
+                        });
+                        let focus_to = c.focus && c.to.is_empty();
+                        let show_cc = c.show_cc;
+                        row(ui, "To", &mut |ui| {
+                            let w = ui.available_width() - if show_cc { 16.0 } else { 84.0 };
+                            let r = ui.add(flat_edit(&mut c.to, "Recipients", w));
+                            if focus_to {
+                                r.request_focus();
                             }
-                            field(ui, "Subject", &mut c.subject, "", false);
+                            if !show_cc && ui.add(egui::Button::new(RichText::new("Cc/Bcc").color(p.accent)).frame(false)).clicked() {
+                                c.show_cc = true;
+                            }
+                        });
+                        if c.show_cc {
+                            row(ui, "Cc", &mut |ui| {
+                                let w = ui.available_width() - 16.0;
+                                ui.add(flat_edit(&mut c.cc, "", w));
+                            });
+                            row(ui, "Bcc", &mut |ui| {
+                                let w = ui.available_width() - 16.0;
+                                ui.add(flat_edit(&mut c.bcc, "", w));
+                            });
+                        }
+                        row(ui, "Subject", &mut |ui| {
+                            let w = ui.available_width() - 16.0;
+                            ui.add(flat_edit(&mut c.subject, "", w));
                         });
                         let focus_body = c.focus && !c.to.is_empty();
                         c.focus = false;
 
-                        if !c.files.is_empty() || !c.carried.is_empty() {
+                        let has_files = !c.files.is_empty() || !c.carried.is_empty();
+                        let status_h = if c.error.is_some() { 44.0 } else { 0.0 };
+                        let footer_h = 60.0 + status_h + if has_files { 48.0 } else { 0.0 };
+                        egui::Frame::new().inner_margin(egui::Margin { left: 16, right: 8, top: 8, bottom: 0 }).show(ui, |ui| {
+                            egui::ScrollArea::vertical()
+                                .id_salt(("cbody", id))
+                                .max_height((ui.available_height() - footer_h).max(100.0))
+                                .auto_shrink([false, false])
+                                .show(ui, |ui| {
+                                    let r = ui.add(
+                                        egui::TextEdit::multiline(&mut c.body)
+                                            .frame(egui::Frame::NONE)
+                                            .desired_width(f32::INFINITY)
+                                            .desired_rows(12)
+                                            .font(theme::regular(ty::BODY)),
+                                    );
+                                    if focus_body {
+                                        r.request_focus();
+                                        if let Some(mut st) = egui::TextEdit::load_state(ui.ctx(), r.id) {
+                                            st.cursor.set_char_range(Some(egui::text::CCursorRange::one(egui::text::CCursor::new(0))));
+                                            st.store(ui.ctx(), r.id);
+                                        }
+                                    }
+                                });
+                        });
+
+                        if has_files {
                             ui.horizontal_wrapped(|ui| {
+                                ui.add_space(12.0);
+                                ui.spacing_mut().item_spacing = egui::vec2(6.0, 6.0);
                                 let mut remove_file = None;
-                                for (i, p) in c.files.iter().enumerate() {
-                                    let name = p.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default();
-                                    let size = std::fs::metadata(p).map(|m| m.len() as usize).unwrap_or(0);
-                                    if ui
-                                        .button(format!("📎 {name} · {}  ✖", model::fmt_size(size)))
-                                        .on_hover_text(p.display().to_string())
-                                        .clicked()
-                                    {
+                                let mut remove_carried = None;
+                                let chip = |ui: &mut egui::Ui, name: &str, size: usize, tip: &str| -> bool {
+                                    let mut remove = false;
+                                    egui::Frame::new()
+                                        .fill(p.window)
+                                        .stroke(Stroke::new(1.0, p.divider))
+                                        .corner_radius(egui::CornerRadius::same(6))
+                                        .inner_margin(egui::Margin { left: 8, right: 0, top: 0, bottom: 0 })
+                                        .show(ui, |ui| {
+                                            ui.horizontal(|ui| {
+                                                ui.spacing_mut().item_spacing.x = 4.0;
+                                                ui.label(kit::glyph(ic::ICON_ATTACH_FILE, 16.0, p.text_secondary));
+                                                let g = kit::one_line(
+                                                    ui,
+                                                    format!("{name} · {}", model::fmt_size(size)),
+                                                    theme::regular(ty::META + 1.0),
+                                                    p.text,
+                                                    180.0,
+                                                );
+                                                ui.label(g).on_hover_text(tip);
+                                                remove = kit::icon_button(ui, ic::ICON_CLOSE, "Remove attachment").clicked();
+                                            });
+                                        });
+                                    remove
+                                };
+                                for (i, f) in c.files.iter().enumerate() {
+                                    let name = f.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default();
+                                    let size = std::fs::metadata(f).map(|m| m.len() as usize).unwrap_or(0);
+                                    if chip(ui, &name, size, &f.display().to_string()) {
                                         remove_file = Some(i);
+                                    }
+                                }
+                                for (i, (name, _, data)) in c.carried.iter().enumerate() {
+                                    if chip(ui, name, data.len(), name) {
+                                        remove_carried = Some(i);
                                     }
                                 }
                                 if let Some(i) = remove_file {
                                     c.files.remove(i);
-                                }
-                                let mut remove_carried = None;
-                                for (i, (name, _, data)) in c.carried.iter().enumerate() {
-                                    if ui.button(format!("📎 {name} · {}  ✖", model::fmt_size(data.len()))).clicked() {
-                                        remove_carried = Some(i);
-                                    }
                                 }
                                 if let Some(i) = remove_carried {
                                     c.carried.remove(i);
@@ -3185,285 +3859,649 @@ impl App {
                                 }
                             });
                         }
-
-                        let bottom_h = 40.0 + if c.error.is_some() || c.note.is_some() { 40.0 } else { 0.0 };
-                        egui::ScrollArea::vertical().id_salt(("cbody", id)).max_height((ui.available_height() - bottom_h).max(120.0)).show(
-                            ui,
-                            |ui| {
-                                let r = ui.add(
-                                    egui::TextEdit::multiline(&mut c.body)
-                                        .desired_width(f32::INFINITY)
-                                        .desired_rows(16)
-                                        .font(egui::TextStyle::Body),
-                                );
-                                if focus_body {
-                                    r.request_focus();
-                                    if let Some(mut st) = egui::TextEdit::load_state(ui.ctx(), r.id) {
-                                        st.cursor.set_char_range(Some(egui::text::CCursorRange::one(egui::text::CCursor::new(0))));
-                                        st.store(ui.ctx(), r.id);
-                                    }
-                                }
-                            },
-                        );
                     });
 
                     if let Some(e) = &c.error {
-                        ui.add(egui::Label::new(RichText::new(e).color(ui.visuals().error_fg_color)).wrap());
-                    } else if let Some(n) = &c.note {
-                        ui.label(RichText::new(n).small().weak());
+                        ui.add_space(4.0);
+                        ui.horizontal(|ui| {
+                            ui.add_space(12.0);
+                            ui.allocate_ui(egui::vec2(ui.available_width() - 12.0, 0.0), |ui| {
+                                kit::notice(ui, Tone::Error, e, None);
+                            });
+                        });
                     }
+                    // Footer: Send, Attach, Save draft · status ……… Discard
                     ui.horizontal(|ui| {
+                        ui.set_height(60.0);
+                        ui.add_space(16.0);
                         let send = ui
-                            .add_enabled(!locked, egui::Button::new(RichText::new("Send").color(Color32::WHITE)).fill(ACCENT))
-                            .on_hover_text("Ctrl+Enter");
+                            .add_enabled_ui(!locked, |ui| kit::primary_button(ui, Some(ic::ICON_SEND), "Send"))
+                            .inner
+                            .on_hover_text("Send (Ctrl+Enter)");
                         if send.clicked() {
                             acts.push(Action::Send(id));
                         }
-                        if c.sending {
-                            ui.spinner();
-                            ui.label(RichText::new("Sending… (closing the app waits for this)").weak());
-                        } else if c.saving.is_some() {
-                            ui.spinner();
-                        }
+                        ui.add_space(4.0);
                         ui.add_enabled_ui(!locked, |ui| {
-                            if ui.button("📎 Attach…").clicked() {
+                            if kit::icon_button(ui, ic::ICON_ATTACH_FILE, "Attach files").clicked() {
                                 acts.push(Action::AttachFiles(id));
                             }
-                            if ui.button("Save draft").clicked() {
+                            if kit::icon_button(ui, ic::ICON_SAVE, "Save draft to the server").clicked() {
                                 acts.push(Action::SaveDraft(id, false));
                             }
                         });
+                        let status = if c.sending {
+                            "Sending…".to_string()
+                        } else if c.saving.is_some() {
+                            "Saving to Drafts…".to_string()
+                        } else if let Some(n) = &c.note {
+                            if n == "Draft saved" {
+                                "Saved to Drafts".to_string()
+                            } else {
+                                n.clone()
+                            }
+                        } else if c.dirty() && c.content_hash() == c.persisted {
+                            "Saved on this device".to_string()
+                        } else {
+                            String::new()
+                        };
+                        if c.sending || c.saving.is_some() {
+                            ui.add(egui::Spinner::new().size(14.0).color(p.text_secondary));
+                        }
+                        ui.label(RichText::new(status).size(ty::META).color(p.text_secondary));
                         ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
-                            if ui.add_enabled(!locked, egui::Button::new("Discard")).clicked() {
+                            ui.add_space(8.0);
+                            if ui.add_enabled_ui(!locked, |ui| kit::icon_button(ui, ic::ICON_DELETE, "Discard")).inner.clicked() {
                                 acts.push(Action::RequestClose(id));
                             }
                         });
                     });
                 });
-            if !open {
-                acts.push(Action::RequestClose(id));
-            }
-            if let (Some(r), Some(p)) = (&resp, hovered_drop) {
-                if r.response.rect.contains(p) && !locked {
+            ctx.data_mut(|d| d.insert_temp(st_id, (minimised, expanded)));
+            if let (Some(r), Some(ptr)) = (&resp, pointer) {
+                if r.response.rect.contains(ptr) && !locked {
                     drop_target = Some(id);
                 }
             }
         }
-        // Files dropped on a compose window (or anywhere, if one is open) attach to it.
+        // Files attach only to the composer they were dropped on; with none
+        // open, a new message is started.
         if !dropped.is_empty() {
-            let target = drop_target.or_else(|| self.composes.iter().rev().find(|c| !c.sending && c.saving.is_none()).map(|c| c.id));
-            match target {
+            match drop_target {
                 Some(t) => {
                     if let Some(c) = self.composes.iter_mut().find(|c| c.id == t) {
                         c.files.extend(dropped);
                     }
                 }
-                None => {
+                None if self.composes.is_empty() => {
                     let a = self.current_acct();
                     if let Some(c) = self.new_compose(a) {
                         c.files.extend(dropped);
                     }
                 }
+                None => self.status = "Drop files onto a message to attach them".into(),
             }
         }
         self.acts.extend(acts);
     }
 
-    fn ui_editor(&mut self, ctx: &egui::Context) {
-        let Some(ed) = self.editor.as_mut() else { return };
-        let settings = self.cfg.settings.clone();
-        let mut open = true;
-        let mut save = false;
-        let mut cancel = false;
-        let title = if ed.editing.is_some() { "Edit account" } else { "Add account" };
-        egui::Window::new(title)
-            .id(Id::unique("account-editor"))
-            .open(&mut open)
-            .collapsible(false)
-            .resizable(false)
-            .default_width(500.0)
-            .anchor(Align2::CENTER_CENTER, Vec2::ZERO)
-            .show(ctx, |ui| {
-                egui::ScrollArea::vertical().max_height(ctx.content_rect().height() - 140.0).show(ui, |ui| {
-                    egui::Grid::new("acct-grid").num_columns(2).spacing([10.0, 8.0]).show(ui, |ui| {
-                        ui.label("Provider");
-                        let mut p = ed.provider;
-                        egui::ComboBox::from_id_salt("provider").selected_text(p.label()).width(320.0).show_ui(ui, |ui| {
-                            for opt in Provider::ALL {
-                                ui.selectable_value(&mut p, opt, opt.label());
-                            }
-                        });
-                        if p != ed.provider {
-                            Self::apply_preset(ed, p, &settings);
-                        }
-                        ui.end_row();
+    /// Begin the browser sign-in for an OAuth account.
+    fn start_oauth(ed: &mut Editor, tx: &Sender<Event>, ctx: &egui::Context) {
+        ed.oauth = OAuthState::Waiting;
+        let (kind, cid, secret, hint) =
+            (ed.auth, ed.client_id.trim().to_string(), ed.client_secret.trim().to_string(), ed.email.trim().to_string());
+        let (tx, ctx2, eid) = (tx.clone(), ctx.clone(), ed.id);
+        std::thread::spawn(move || {
+            let result = oauth::authorize(kind, &cid, &secret, &hint);
+            let _ = tx.send(Event { acct: String::new(), gen: 0, kind: Ev::OAuth { editor: eid, result } });
+            ctx2.request_repaint();
+        });
+    }
 
-                        ui.label("Your name");
-                        ui.add(egui::TextEdit::singleline(&mut ed.name).hint_text("Jane Doe").desired_width(320.0));
-                        ui.end_row();
-                        ui.label("Email");
-                        let r = ui.add(egui::TextEdit::singleline(&mut ed.email).hint_text("jane@example.com").desired_width(320.0));
-                        if r.changed() {
-                            if !ed.username_touched {
-                                ed.username = ed.email.trim().to_string();
-                            }
-                            if let Some(g) = Provider::guess(&ed.email) {
-                                if g != ed.provider && ed.editing.is_none() {
-                                    Self::apply_preset(ed, g, &settings);
-                                }
-                            }
-                        }
-                        ui.end_row();
-
-                        ui.label("Sign-in");
-                        let mut auth = ed.auth;
-                        let name = |a: AuthKind| match a {
-                            AuthKind::Password => "Password / app password",
-                            AuthKind::OAuthGoogle => "Google (OAuth)",
-                            AuthKind::OAuthMicrosoft => "Microsoft (OAuth)",
-                        };
-                        egui::ComboBox::from_id_salt("auth").selected_text(name(auth)).width(320.0).show_ui(ui, |ui| {
-                            for a in [AuthKind::Password, AuthKind::OAuthGoogle, AuthKind::OAuthMicrosoft] {
-                                ui.selectable_value(&mut auth, a, name(a));
-                            }
-                        });
-                        if auth != ed.auth {
-                            ed.auth = auth;
-                            ed.oauth = OAuthState::Idle;
-                            Self::default_client(ed, &settings);
-                        }
-                        ui.end_row();
-                    });
-
-                    // Setup guidance for this provider and sign-in method.
-                    let (text, links) = ed.provider.guide(ed.auth);
-                    egui::Frame::group(ui.style()).show(ui, |ui| {
-                        ui.set_width(ui.available_width());
-                        ui.add(egui::Label::new(RichText::new(text).small()).wrap());
-                        for (label, url) in links.iter() {
-                            ui.hyperlink_to(RichText::new(format!("↗ {label}")).small(), *url);
-                        }
-                    });
-                    ui.add_space(4.0);
-
-                    egui::Grid::new("acct-grid2").num_columns(2).spacing([10.0, 8.0]).show(ui, |ui| match ed.auth {
-                        AuthKind::Password => {
-                            ui.label("Password");
-                            ui.add(
-                                egui::TextEdit::singleline(&mut ed.password)
-                                    .password(true)
-                                    .hint_text(if ed.editing.is_some() { "unchanged" } else { "app password" })
-                                    .desired_width(320.0),
-                            );
-                            ui.end_row();
-                        }
-                        _ => {
-                            ui.label("Client ID");
-                            ui.add(egui::TextEdit::singleline(&mut ed.client_id).desired_width(320.0));
-                            ui.end_row();
-                            if ed.auth == AuthKind::OAuthGoogle {
-                                ui.label("Client secret");
-                                ui.add(egui::TextEdit::singleline(&mut ed.client_secret).password(true).desired_width(320.0));
-                                ui.end_row();
-                            }
-                            ui.label("");
-                            ui.horizontal_wrapped(|ui| {
-                                let waiting = matches!(ed.oauth, OAuthState::Waiting);
-                                let valid = oauth::validate_client_id(ed.auth, &ed.client_id);
-                                let btn = ui.add_enabled(!waiting && valid.is_ok(), egui::Button::new("Sign in with browser"));
-                                if let Err(e) = &valid {
-                                    btn.on_disabled_hover_text(e.as_str());
-                                    if !ed.client_id.trim().is_empty() {
-                                        ui.label(RichText::new(e).small().color(ui.visuals().warn_fg_color));
-                                    }
-                                } else if btn.clicked() {
-                                    ed.oauth = OAuthState::Waiting;
-                                    let (kind, cid, secret, hint) = (ed.auth, ed.client_id.trim().to_string(), ed.client_secret.trim().to_string(), ed.email.trim().to_string());
-                                    let (tx, ctx2, eid) = (self.tx.clone(), ctx.clone(), ed.id);
-                                    std::thread::spawn(move || {
-                                        let result = oauth::authorize(kind, &cid, &secret, &hint);
-                                        let _ = tx.send(Event { acct: String::new(), gen: 0, kind: Ev::OAuth { editor: eid, result } });
-                                        ctx2.request_repaint();
-                                    });
-                                }
-                                match &ed.oauth {
-                                    OAuthState::Idle => {}
-                                    OAuthState::Waiting => {
-                                        ui.spinner();
-                                        ui.label(RichText::new("Waiting for browser…").weak());
-                                    }
-                                    OAuthState::Done(_) => {
-                                        ui.label(RichText::new("✔ Signed in").color(GOOD));
-                                    }
-                                    OAuthState::Failed(e) => {
-                                        ui.add(egui::Label::new(RichText::new(e).small().color(ui.visuals().error_fg_color)).wrap());
-                                    }
-                                }
-                            });
-                            ui.end_row();
-                        }
-                    });
-
-                    ui.add_space(4.0);
-                    egui::CollapsingHeader::new("Server settings").default_open(ed.provider == Provider::Custom).show(ui, |ui| {
-                        egui::Grid::new("srv-grid").num_columns(4).spacing([8.0, 6.0]).show(ui, |ui| {
-                            for (label, srv) in [("IMAP", &mut ed.imap), ("SMTP", &mut ed.smtp)] {
-                                ui.label(label);
-                                ui.add(egui::TextEdit::singleline(&mut srv.host).hint_text("host").desired_width(200.0));
-                                ui.add(egui::DragValue::new(&mut srv.port).range(1..=65535));
-                                egui::ComboBox::from_id_salt(("sec", label))
-                                    .selected_text(match srv.security {
-                                        Security::Tls => "SSL/TLS",
-                                        Security::StartTls => "STARTTLS",
-                                    })
-                                    .show_ui(ui, |ui| {
-                                        ui.selectable_value(&mut srv.security, Security::Tls, "SSL/TLS");
-                                        ui.selectable_value(&mut srv.security, Security::StartTls, "STARTTLS");
-                                    });
-                                ui.end_row();
-                            }
-                            ui.label("User");
-                            if ui.add(egui::TextEdit::singleline(&mut ed.username).desired_width(200.0)).changed() {
-                                ed.username_touched = true;
-                            }
-                            ui.end_row();
-                        });
-                        ui.checkbox(&mut ed.save_sent, "Save a copy of sent mail to the Sent folder").on_hover_text("Gmail and Outlook do this automatically; leave off for them.");
-                    });
-                    egui::CollapsingHeader::new("Sending identities (aliases)").show(ui, |ui| {
-                        ui.label(RichText::new("Other addresses this mailbox may send as, one per line, e.g. \"Jane Doe <jane@work.example>\". Your provider must allow sending as them.").small().weak());
-                        ui.add(egui::TextEdit::multiline(&mut ed.aliases).desired_rows(2).desired_width(f32::INFINITY));
-                    });
-                    egui::CollapsingHeader::new("Signature & notifications").show(ui, |ui| {
-                        ui.add(egui::TextEdit::multiline(&mut ed.signature).hint_text("Signature").desired_rows(3).desired_width(f32::INFINITY));
-                        ui.checkbox(&mut ed.notify, "Notify me about new mail in this account");
-                    });
-
-                    if let Some(e) = &ed.error {
-                        ui.add(egui::Label::new(RichText::new(e).color(ui.visuals().error_fg_color)).wrap());
+    /// The provider-specific sign-in controls (password or OAuth).
+    fn signin_controls(
+        ui: &mut egui::Ui,
+        ed: &mut Editor,
+        show_password: &mut bool,
+        settings: &crate::config::Settings,
+        tx: &Sender<Event>,
+    ) {
+        let p = kit::pal(ui);
+        let ctx = ui.ctx().clone();
+        let (text, links) = ed.provider.guide(ed.auth);
+        egui::Frame::new().fill(p.window).corner_radius(egui::CornerRadius::same(6)).inner_margin(egui::Margin::same(12)).show(ui, |ui| {
+            ui.set_width(ui.available_width());
+            ui.add(egui::Label::new(RichText::new(text).size(ty::META + 1.0).color(p.text)).wrap());
+            for (label, url) in links.iter() {
+                ui.hyperlink_to(RichText::new(format!("{label} ↗")).size(ty::META + 1.0).color(p.accent), *url);
+            }
+        });
+        ui.add_space(12.0);
+        match ed.auth {
+            AuthKind::Password => {
+                ui.label(RichText::new(if ed.provider == Provider::Custom { "Password" } else { "App password" }).color(p.text_secondary));
+                ui.horizontal(|ui| {
+                    let r = ui.add(
+                        kit::text_field(&mut ed.password, if ed.editing.is_some() { "Unchanged" } else { "" })
+                            .password(!*show_password)
+                            .desired_width(ui.available_width() - 40.0),
+                    );
+                    if r.lost_focus() && ui.input(|i| i.key_pressed(K::Enter)) {
+                        ui.memory_mut(|m| m.data.insert_temp(Id::unique("setup-submit"), true));
                     }
-                    ui.add_space(6.0);
-                    ui.horizontal(|ui| {
-                        if ui.add(egui::Button::new(RichText::new("Save").color(Color32::WHITE)).fill(ACCENT)).clicked() {
-                            save = true;
-                        }
-                        if ui.button("Cancel").clicked() {
-                            cancel = true;
-                        }
-                    });
+                    if kit::icon_button(
+                        ui,
+                        if *show_password { ic::ICON_VISIBILITY_OFF } else { ic::ICON_VISIBILITY },
+                        if *show_password { "Hide password" } else { "Show password" },
+                    )
+                    .clicked()
+                    {
+                        *show_password = !*show_password;
+                    }
                 });
-            });
-        if save {
-            match self.save_editor() {
-                Ok(()) => self.editor = None,
-                Err(e) => {
-                    if let Some(ed) = self.editor.as_mut() {
-                        ed.error = Some(e);
-                    }
+                if ed.provider == Provider::Gmail
+                    && ui
+                        .add(
+                            egui::Button::new(RichText::new("Use Google sign-in instead").size(ty::META + 1.0).color(p.accent))
+                                .frame(false),
+                        )
+                        .clicked()
+                {
+                    ed.auth = AuthKind::OAuthGoogle;
+                    Self::default_client(ed, settings);
                 }
             }
-        } else if cancel || !open {
-            self.editor = None;
+            _ => {
+                let has_default = match ed.auth {
+                    AuthKind::OAuthMicrosoft => !settings.microsoft_client_id.trim().is_empty(),
+                    _ => !settings.google_client_id.trim().is_empty(),
+                };
+                if !has_default || ed.client_id.trim().is_empty() {
+                    ui.label(RichText::new("Client ID").color(p.text_secondary));
+                    ui.add(kit::text_field(&mut ed.client_id, "Paste the Application (client) ID").desired_width(f32::INFINITY));
+                    if ed.auth == AuthKind::OAuthGoogle {
+                        ui.label(RichText::new("Client secret").color(p.text_secondary));
+                        ui.add(kit::text_field(&mut ed.client_secret, "").password(true).desired_width(f32::INFINITY));
+                    }
+                    ui.add_space(8.0);
+                }
+                let valid = oauth::validate_client_id(ed.auth, &ed.client_id);
+                ui.horizontal(|ui| {
+                    let waiting = matches!(ed.oauth, OAuthState::Waiting);
+                    let label = if ed.auth == AuthKind::OAuthMicrosoft { "Sign in with Microsoft" } else { "Sign in with Google" };
+                    let b = ui.add_enabled_ui(!waiting && valid.is_ok(), |ui| kit::secondary_button(ui, label)).inner;
+                    if b.clicked() {
+                        Self::start_oauth(ed, tx, &ctx);
+                    }
+                    match &ed.oauth {
+                        OAuthState::Waiting => {
+                            ui.add(egui::Spinner::new().size(14.0).color(p.text_secondary));
+                            ui.label(RichText::new("Finish signing in in your browser…").size(ty::META + 1.0).color(p.text_secondary));
+                        }
+                        OAuthState::Done(_) => {
+                            ui.label(kit::glyph(ic::ICON_CHECK_CIRCLE, 18.0, p.success));
+                            ui.label(RichText::new("Signed in").color(p.success));
+                        }
+                        _ => {}
+                    }
+                });
+                if let Err(e) = &valid {
+                    if !ed.client_id.trim().is_empty() {
+                        kit::notice(ui, Tone::Warning, e, None);
+                    }
+                }
+                if let OAuthState::Failed(e) = &ed.oauth {
+                    kit::notice(ui, Tone::Error, e, None);
+                }
+            }
+        }
+    }
+
+    /// Incoming and outgoing server settings, side by side.
+    fn server_form(ui: &mut egui::Ui, ed: &mut Editor) {
+        let p = kit::pal(ui);
+        ui.columns(2, |cols| {
+            for (ui, (title, srv, imap)) in
+                cols.iter_mut().zip([("Incoming (IMAP)", &mut ed.imap, true), ("Outgoing (SMTP)", &mut ed.smtp, false)])
+            {
+                ui.label(RichText::new(title).font(theme::semibold(ty::UI)).color(p.text));
+                ui.label(RichText::new("Server").size(ty::META).color(p.text_secondary));
+                ui.add(
+                    kit::text_field(&mut srv.host, if imap { "imap.example.com" } else { "smtp.example.com" }).desired_width(f32::INFINITY),
+                );
+                ui.horizontal(|ui| {
+                    ui.vertical(|ui| {
+                        ui.label(RichText::new("Security").size(ty::META).color(p.text_secondary));
+                        let before = srv.security;
+                        egui::ComboBox::from_id_salt(("sec", title))
+                            .selected_text(match srv.security {
+                                Security::Tls => "SSL/TLS",
+                                Security::StartTls => "STARTTLS",
+                            })
+                            .width(110.0)
+                            .show_ui(ui, |ui| {
+                                ui.selectable_value(&mut srv.security, Security::Tls, "SSL/TLS");
+                                ui.selectable_value(&mut srv.security, Security::StartTls, "STARTTLS");
+                            });
+                        // Standard ports follow the security choice unless customised.
+                        if before != srv.security {
+                            let standard = [993u16, 143, 465, 587];
+                            if standard.contains(&srv.port) {
+                                srv.port = match (imap, srv.security) {
+                                    (true, Security::Tls) => 993,
+                                    (true, Security::StartTls) => 143,
+                                    (false, Security::Tls) => 465,
+                                    (false, Security::StartTls) => 587,
+                                };
+                            }
+                        }
+                    });
+                    ui.vertical(|ui| {
+                        ui.label(RichText::new("Port").size(ty::META).color(p.text_secondary));
+                        ui.add(egui::DragValue::new(&mut srv.port).range(1..=65535));
+                    });
+                });
+            }
+        });
+        ui.add_space(8.0);
+        ui.label(RichText::new("User name").size(ty::META).color(p.text_secondary));
+        if ui.add(kit::text_field(&mut ed.username, "Usually your email address").desired_width(f32::INFINITY)).changed() {
+            ed.username_touched = true;
+        }
+    }
+
+    /// Run the incoming/outgoing sign-in checks for the wizard on a background thread.
+    fn start_verify(&mut self) {
+        let Some(st) = self.setup.as_mut() else { return };
+        st.error = None;
+        let ed = &mut st.ed;
+        let id = ed.new_id.clone().unwrap_or_else(crate::config::new_account_id);
+        ed.new_id = Some(id.clone());
+        if ed.username.trim().is_empty() {
+            ed.username = ed.email.trim().to_string();
+        }
+        let stored = match (&ed.auth, &ed.oauth) {
+            (AuthKind::Password, _) if ed.password.is_empty() => Err("Enter your password".to_string()),
+            (AuthKind::Password, _) => secrets::set(&id, secrets::PASSWORD, &ed.password),
+            (_, OAuthState::Done(t)) => secrets::set(&id, secrets::REFRESH, t),
+            _ => Err("Sign in with your browser first".to_string()),
+        };
+        if let Err(e) = stored {
+            st.error = Some(e);
+            return;
+        }
+        let acct = Account {
+            id,
+            name: ed.name.trim().to_string(),
+            email: ed.email.trim().to_string(),
+            username: ed.username.trim().to_string(),
+            imap: Server { host: ed.imap.host.trim().into(), ..ed.imap.clone() },
+            smtp: Server { host: ed.smtp.host.trim().into(), ..ed.smtp.clone() },
+            auth: ed.auth,
+            oauth_client_id: ed.client_id.trim().into(),
+            oauth_client_secret: ed.client_secret.trim().into(),
+            save_sent: ed.save_sent,
+            signature: String::new(),
+            paused: false,
+            notify: true,
+            aliases: vec![],
+        };
+        st.step = SetupStep::Verify;
+        st.incoming = Check::Running;
+        st.outgoing = Check::Running;
+        let (tx, ctx, setup) = (self.tx.clone(), self.ctx.clone(), st.id);
+        std::thread::spawn(move || {
+            oauth::forget(&acct.id);
+            let imap = crate::net::connect(&acct).map(|mut c| {
+                let _ = c.sess.logout();
+            });
+            let imap = imap.map_err(|e| e.message().to_string());
+            let smtp = crate::smtp::verify(&acct);
+            let _ = tx.send(Event { acct: String::new(), gen: 0, kind: Ev::Verified { setup, imap, smtp } });
+            ctx.request_repaint();
+        });
+    }
+
+    /// Both checks passed: save the account and start syncing.
+    fn finish_setup(&mut self) {
+        let Some(mut st) = self.setup.take() else { return };
+        self.editor = Some(std::mem::replace(&mut st.ed, Self::blank_editor(0)));
+        let result = self.save_editor();
+        st.ed = self.editor.take().unwrap_or_else(|| Self::blank_editor(0));
+        match result {
+            Ok(()) => {
+                st.added = self.accts.iter().rposition(|a| a.live());
+                st.step = SetupStep::Done;
+            }
+            Err(e) => {
+                st.error = Some(e);
+                st.step = SetupStep::SignIn;
+            }
+        }
+        self.setup = Some(st);
+    }
+
+    fn blank_editor(id: u64) -> Editor {
+        let (imap, smtp, auth, save_sent) = Provider::Custom.preset();
+        Editor {
+            id,
+            editing: None,
+            provider: Provider::Custom,
+            name: String::new(),
+            email: String::new(),
+            username: String::new(),
+            username_touched: false,
+            password: String::new(),
+            auth,
+            imap,
+            smtp,
+            client_id: String::new(),
+            client_secret: String::new(),
+            save_sent,
+            signature: String::new(),
+            aliases: String::new(),
+            notify: true,
+            oauth: OAuthState::Idle,
+            error: None,
+            new_id: None,
+        }
+    }
+
+    fn cancel_setup(&mut self) {
+        if let Some(st) = self.setup.take() {
+            // Nothing was saved: drop any credential stored for verification.
+            if st.step != SetupStep::Done {
+                if let Some(id) = &st.ed.new_id {
+                    secrets::delete(id, secrets::PASSWORD);
+                    secrets::delete(id, secrets::REFRESH);
+                }
+            }
+        }
+    }
+
+    /// The add-account wizard.
+    fn ui_editor(&mut self, ctx: &egui::Context) {
+        let p = theme::palette(ctx);
+        let settings = self.cfg.settings.clone();
+        let Some(st) = self.setup.as_mut() else { return };
+        let mut close = false;
+        let mut continue_email = false;
+        let mut verify = false;
+        let tx = self.tx.clone();
+        let existing: Vec<(String, String)> =
+            self.accts.iter().filter(|a| a.live()).map(|a| (a.cfg.email.to_ascii_lowercase(), a.cfg.imap.host.clone())).collect();
+        let modal = egui::Modal::new(Id::unique("setup-modal"))
+            .frame(
+                egui::Frame::new()
+                    .fill(p.raised)
+                    .corner_radius(egui::CornerRadius::same(8))
+                    .inner_margin(egui::Margin::same(28))
+                    .shadow(ctx.global_style().visuals.window_shadow),
+            )
+            .show(ctx, |ui| {
+                ui.set_width(460.0);
+                // Progress: Email · Sign in · Verify · Done
+                let stage = match st.step {
+                    SetupStep::Email | SetupStep::Detecting => 0,
+                    SetupStep::SignIn | SetupStep::Manual => 1,
+                    SetupStep::Verify => 2,
+                    SetupStep::Done => 3,
+                };
+                ui.horizontal(|ui| {
+                    for (i, name) in ["Email", "Sign in", "Verify", "Done"].iter().enumerate() {
+                        let color = if i <= stage { p.accent } else { p.text_disabled };
+                        ui.label(RichText::new(*name).size(ty::META).color(color).strong());
+                        if i < 3 {
+                            ui.label(RichText::new("—").size(ty::META).color(p.divider));
+                        }
+                    }
+                });
+                ui.add_space(16.0);
+                let submit = ui.memory_mut(|m| m.data.remove_temp::<bool>(Id::unique("setup-submit"))).unwrap_or(false);
+                match st.step {
+                    SetupStep::Email | SetupStep::Detecting => {
+                        kit::section_title(ui, "Add an email account");
+                        ui.label(RichText::new("Email address").color(p.text_secondary));
+                        let r = ui.add_enabled(
+                            st.step == SetupStep::Email,
+                            kit::text_field(&mut st.ed.email, "you@example.com").desired_width(f32::INFINITY),
+                        );
+                        if st.step == SetupStep::Email && !r.has_focus() && st.ed.email.is_empty() {
+                            r.request_focus();
+                        }
+                        let enter = r.lost_focus() && ui.input(|i| i.key_pressed(K::Enter));
+                        if let Some(e) = &st.error {
+                            ui.add_space(8.0);
+                            kit::notice(ui, Tone::Error, e, None);
+                        }
+                        ui.add_space(20.0);
+                        ui.horizontal(|ui| {
+                            if st.step == SetupStep::Detecting {
+                                ui.add(egui::Spinner::new().size(16.0).color(p.text_secondary));
+                                ui.label(RichText::new("Finding your settings…").color(p.text_secondary));
+                            } else if ui.add(egui::Button::new(RichText::new("Set up manually").color(p.accent)).frame(false)).clicked() {
+                                Self::apply_preset(&mut st.ed, Provider::Custom, &settings);
+                                st.ed.username = st.ed.email.trim().to_string();
+                                st.step = SetupStep::Manual;
+                            }
+                            ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                                let ok = st.ed.email.trim().contains('@') && st.step == SetupStep::Email;
+                                if ui.add_enabled_ui(ok, |ui| kit::primary_button(ui, None, "Continue")).inner.clicked() || (enter && ok) {
+                                    continue_email = true;
+                                }
+                                if kit::secondary_button(ui, "Cancel").clicked() {
+                                    close = true;
+                                }
+                            });
+                        });
+                        if continue_email {
+                            let email = st.ed.email.trim().to_ascii_lowercase();
+                            if existing.iter().any(|(e, _)| *e == email) {
+                                st.error = Some(format!("{email} is already added. Edit it in Settings › Accounts."));
+                                continue_email = false;
+                            } else {
+                                st.error = None;
+                                if !st.ed.username_touched {
+                                    st.ed.username = st.ed.email.trim().to_string();
+                                }
+                            }
+                        }
+                    }
+                    SetupStep::SignIn => {
+                        kit::section_title(ui, "Sign in");
+                        ui.label(RichText::new(&st.ed.email).color(p.text));
+                        ui.label(RichText::new(&st.detected).size(ty::META).color(p.text_secondary));
+                        ui.add_space(12.0);
+                        Self::signin_controls(ui, &mut st.ed, &mut st.show_password, &settings, &tx);
+                        ui.add_space(12.0);
+                        ui.label(RichText::new("Your name (shown to people you email)").color(p.text_secondary));
+                        ui.add(kit::text_field(&mut st.ed.name, "Optional").desired_width(f32::INFINITY));
+                        if let Some(e) = &st.error {
+                            ui.add_space(8.0);
+                            kit::notice(ui, Tone::Error, e, None);
+                        }
+                        ui.add_space(20.0);
+                        ui.horizontal(|ui| {
+                            if ui.add(egui::Button::new(RichText::new("Server settings").color(p.accent)).frame(false)).clicked() {
+                                st.step = SetupStep::Manual;
+                            }
+                            ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                                let ready = match st.ed.auth {
+                                    AuthKind::Password => !st.ed.password.is_empty(),
+                                    _ => matches!(st.ed.oauth, OAuthState::Done(_)),
+                                };
+                                if ui.add_enabled_ui(ready, |ui| kit::primary_button(ui, None, "Continue")).inner.clicked()
+                                    || (submit && ready)
+                                {
+                                    verify = true;
+                                }
+                                if kit::secondary_button(ui, "Back").clicked() {
+                                    st.step = SetupStep::Email;
+                                }
+                            });
+                        });
+                    }
+                    SetupStep::Manual => {
+                        kit::section_title(ui, "Server settings");
+                        if !st.detected.is_empty() {
+                            ui.label(RichText::new(&st.detected).size(ty::META + 1.0).color(p.text_secondary));
+                            ui.add_space(8.0);
+                        }
+                        Self::server_form(ui, &mut st.ed);
+                        ui.add_space(12.0);
+                        Self::signin_controls(ui, &mut st.ed, &mut st.show_password, &settings, &tx);
+                        if let Some(e) = &st.error {
+                            ui.add_space(8.0);
+                            kit::notice(ui, Tone::Error, e, None);
+                        }
+                        ui.add_space(20.0);
+                        ui.horizontal(|ui| {
+                            ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                                let ok = !st.ed.imap.host.trim().is_empty() && !st.ed.smtp.host.trim().is_empty();
+                                if ui.add_enabled_ui(ok, |ui| kit::primary_button(ui, None, "Continue")).inner.clicked() || (submit && ok) {
+                                    verify = true;
+                                }
+                                if kit::secondary_button(ui, "Back").clicked() {
+                                    st.step = SetupStep::Email;
+                                }
+                            });
+                        });
+                    }
+                    SetupStep::Verify => {
+                        kit::section_title(ui, "Checking your account");
+                        let row = |ui: &mut egui::Ui, label: &str, check: &Check| {
+                            ui.horizontal(|ui| {
+                                match check {
+                                    Check::Running | Check::Waiting => {
+                                        ui.add(egui::Spinner::new().size(18.0).color(p.text_secondary));
+                                    }
+                                    Check::Ok => {
+                                        ui.label(kit::glyph(ic::ICON_CHECK_CIRCLE, 20.0, p.success));
+                                    }
+                                    Check::Failed(_) => {
+                                        ui.label(kit::glyph(ic::ICON_ERROR, 20.0, p.error));
+                                    }
+                                }
+                                ui.label(RichText::new(label).color(p.text));
+                            });
+                            if let Check::Failed(e) = check {
+                                ui.horizontal(|ui| {
+                                    ui.add_space(28.0);
+                                    ui.add(egui::Label::new(RichText::new(e).size(ty::META + 1.0).color(p.text_secondary)).wrap());
+                                });
+                            }
+                            ui.add_space(6.0);
+                        };
+                        ui.horizontal(|ui| {
+                            ui.label(kit::glyph(ic::ICON_CHECK_CIRCLE, 20.0, p.success));
+                            ui.label(RichText::new("Found settings").color(p.text));
+                        });
+                        ui.add_space(6.0);
+                        row(ui, "Signed in to incoming mail", &st.incoming);
+                        row(ui, "Signed in to outgoing mail", &st.outgoing);
+                        let failed = matches!(st.incoming, Check::Failed(_)) || matches!(st.outgoing, Check::Failed(_));
+                        if let Some(e) = &st.error {
+                            kit::notice(ui, Tone::Error, e, None);
+                        }
+                        ui.add_space(20.0);
+                        ui.horizontal(|ui| {
+                            if failed
+                                && ui.add(egui::Button::new(RichText::new("Edit server settings").color(p.accent)).frame(false)).clicked()
+                            {
+                                st.step = SetupStep::Manual;
+                            }
+                            ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                                if failed {
+                                    if kit::primary_button(ui, None, "Try again").clicked() {
+                                        verify = true;
+                                    }
+                                    if kit::secondary_button(ui, "Back").clicked() {
+                                        st.step = SetupStep::SignIn;
+                                    }
+                                } else if kit::secondary_button(ui, "Cancel").clicked() {
+                                    close = true;
+                                }
+                            });
+                        });
+                    }
+                    SetupStep::Done => {
+                        ui.horizontal(|ui| {
+                            ui.label(kit::glyph(ic::ICON_CHECK_CIRCLE, 28.0, p.success));
+                            ui.label(
+                                RichText::new(format!("{} is ready", st.ed.email.trim())).font(theme::semibold(ty::HEADING)).color(p.text),
+                            );
+                        });
+                        ui.add_space(4.0);
+                        ui.label(RichText::new("Your mail is syncing now.").color(p.text_secondary));
+                        ui.add_space(16.0);
+                        if let Some(i) = st.added {
+                            if let Some(a) = self.accts.get_mut(i) {
+                                ui.label(RichText::new("Signature (optional)").color(p.text_secondary));
+                                if ui
+                                    .add(
+                                        egui::TextEdit::multiline(&mut a.cfg.signature)
+                                            .desired_rows(3)
+                                            .desired_width(f32::INFINITY)
+                                            .margin(egui::Margin::same(8)),
+                                    )
+                                    .changed()
+                                {
+                                    self.cfg
+                                        .accounts
+                                        .iter_mut()
+                                        .filter(|x| x.id == a.cfg.id)
+                                        .for_each(|x| x.signature = a.cfg.signature.clone());
+                                }
+                                ui.add_space(8.0);
+                                ui.horizontal(|ui| {
+                                    let mut n = a.cfg.notify;
+                                    if kit::switch(ui, &mut n, "Notify me about new mail").changed() {
+                                        a.cfg.notify = n;
+                                        a.shared.notify.store(settings.notifications && n, Ordering::Relaxed);
+                                    }
+                                    ui.label(RichText::new("Notify me about new mail").color(p.text));
+                                });
+                            }
+                        }
+                        ui.add_space(20.0);
+                        ui.horizontal(|ui| {
+                            ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                                if kit::primary_button(ui, None, "Open inbox").clicked() {
+                                    close = true;
+                                }
+                                if kit::secondary_button(ui, "Add another").clicked() {
+                                    self.acts.push(Action::AddAccount);
+                                    close = true;
+                                }
+                            });
+                        });
+                    }
+                }
+            });
+        if modal.should_close() && !matches!(self.setup.as_ref().map(|s| s.step), Some(SetupStep::Done)) {
+            close = true;
+        }
+        if let Some(st) = self.setup.as_mut() {
+            if continue_email {
+                st.step = SetupStep::Detecting;
+                let (tx, ctx2, sid, email) = (self.tx.clone(), ctx.clone(), st.id, st.ed.email.trim().to_string());
+                std::thread::spawn(move || {
+                    let found = crate::autoconfig::lookup(&email);
+                    let _ = tx.send(Event { acct: String::new(), gen: 0, kind: Ev::Autoconfig { setup: sid, found } });
+                    ctx2.request_repaint();
+                });
+            }
+        }
+        if verify {
+            self.start_verify();
+        }
+        if close {
+            if matches!(self.setup.as_ref().map(|s| s.step), Some(SetupStep::Done)) {
+                self.save_config();
+                self.setup = None;
+            } else {
+                self.cancel_setup();
+            }
         }
     }
 
@@ -3471,111 +4509,365 @@ impl App {
         if !self.settings_open {
             return;
         }
-        let mut open = true;
+        let p = theme::palette(ctx);
         let mut changed = false;
         let mut update_now = false;
         let mut install: Option<update::Release> = None;
+        let mut close = false;
+        let mut save_account = false;
+        let tx = self.tx.clone();
         let accts: Vec<(String, String)> =
             self.accts.iter().filter(|a| a.live()).map(|a| (a.cfg.id.clone(), a.cfg.label().to_string())).collect();
-        egui::Window::new("Settings").open(&mut open).collapsible(false).resizable(false).default_width(460.0).show(ctx, |ui| {
-            let s = &mut self.cfg.settings;
-            egui::Grid::new("settings").num_columns(2).spacing([10.0, 8.0]).show(ui, |ui| {
-                ui.label("Check for mail every");
-                changed |= ui
-                    .add(egui::DragValue::new(&mut s.poll_secs).range(15..=3600).suffix(" s"))
-                    .on_hover_text("Used when the server doesn't support push (IDLE). With push, new mail arrives instantly and this becomes a 5-minute safety check.")
-                    .changed();
-                ui.end_row();
-                ui.label("Messages per folder");
-                changed |= ui
-                    .add(egui::DragValue::new(&mut s.initial_fetch).range(50..=5000))
-                    .on_hover_text("How many recent messages to sync per folder (and per 'Load older'). Applies after restart.")
-                    .changed();
-                ui.end_row();
-                ui.label("New messages from");
-                let current = accts.iter().find(|(id, _)| *id == s.default_account).map(|(_, l)| l.clone()).unwrap_or_else(|| "First account".into());
-                egui::ComboBox::from_id_salt("default-acct").selected_text(current).show_ui(ui, |ui| {
-                    for (id, label) in &accts {
-                        changed |= ui.selectable_value(&mut s.default_account, id.clone(), label).changed();
-                    }
+        let screen = ctx.content_rect();
+        let size = egui::vec2(840.0f32.min(screen.width() - 48.0), 620.0f32.min(screen.height() - 48.0));
+        let modal = egui::Modal::new(Id::unique("settings-modal"))
+            .frame(
+                egui::Frame::new()
+                    .fill(p.raised)
+                    .corner_radius(egui::CornerRadius::same(8))
+                    .shadow(ctx.global_style().visuals.window_shadow),
+            )
+            .show(ctx, |ui| {
+                ui.set_min_size(size);
+                ui.set_max_size(size);
+                ui.horizontal_top(|ui| {
+                    // Sidebar
+                    egui::Frame::new()
+                        .fill(p.nav)
+                        .corner_radius(egui::CornerRadius { nw: 8, sw: 8, ne: 0, se: 0 })
+                        .inner_margin(egui::Margin::same(12))
+                        .show(ui, |ui| {
+                            ui.vertical(|ui| {
+                                ui.set_width(176.0);
+                                ui.set_height(size.y - 24.0);
+                                ui.spacing_mut().item_spacing.y = 0.0;
+                                ui.add_space(4.0);
+                                ui.label(RichText::new("Settings").font(theme::semibold(ty::HEADING)).color(p.text));
+                                ui.add_space(16.0);
+                                for (page, icon, label) in [
+                                    (SettingsPage::Appearance, ic::ICON_PALETTE, "Appearance"),
+                                    (SettingsPage::Accounts, ic::ICON_PERSON, "Accounts"),
+                                    (SettingsPage::Reading, ic::ICON_ARTICLE, "Reading"),
+                                    (SettingsPage::Privacy, ic::ICON_SHIELD, "Privacy"),
+                                    (SettingsPage::Notifications, ic::ICON_NOTIFICATIONS, "Notifications"),
+                                    (SettingsPage::Sync, ic::ICON_SYNC, "Sync"),
+                                    (SettingsPage::Advanced, ic::ICON_TUNE, "Advanced"),
+                                    (SettingsPage::About, ic::ICON_INFO, "About & updates"),
+                                ] {
+                                    if kit::nav_row(ui, icon, label, 0, self.settings_page == page, 0.0, true).clicked() {
+                                        self.settings_page = page;
+                                        if page != SettingsPage::Accounts {
+                                            self.editor = None;
+                                        }
+                                    }
+                                }
+                            })
+                        });
+                    // Content
+                    ui.vertical(|ui| {
+                        ui.set_width(size.x - 200.0 - 16.0);
+                        ui.horizontal(|ui| {
+                            ui.add_space(ui.available_width() - 40.0);
+                            if kit::icon_button(ui, ic::ICON_CLOSE, "Close (Esc)").clicked() {
+                                close = true;
+                            }
+                        });
+                        egui::ScrollArea::vertical()
+                            .id_salt(("settings-page", self.settings_page as u8))
+                            .auto_shrink([false, false])
+                            .max_height(size.y - 56.0)
+                            .show(ui, |ui| {
+                                ui.set_width(size.x - 200.0 - 40.0);
+                                let s = &mut self.cfg.settings;
+                                match self.settings_page {
+                                    SettingsPage::Appearance => {
+                                        kit::section_title(ui, "Appearance");
+                                        kit::setting_row(ui, "Theme", "Follow your system, or always use light or dark.", |ui| {
+                                            for (v, l) in [("dark", "Dark"), ("light", "Light"), ("system", "System")] {
+                                                if ui.selectable_label(s.theme == v, l).clicked() && s.theme != v {
+                                                    s.theme = v.into();
+                                                    theme::set_preference(ui.ctx(), v);
+                                                    changed = true;
+                                                }
+                                            }
+                                        });
+                                        kit::setting_row(ui, "Compact message list", "Shorter rows, so more messages fit.", |ui| {
+                                            changed |= kit::switch(ui, &mut s.compact, "Compact message list").changed();
+                                        });
+                                    }
+                                    SettingsPage::Reading => {
+                                        kit::section_title(ui, "Reading");
+                                        kit::setting_row(
+                                            ui,
+                                            "Mark as read when opened",
+                                            "Otherwise messages stay unread until you mark them.",
+                                            |ui| {
+                                                changed |= kit::switch(ui, &mut s.mark_read_on_open, "Mark as read when opened").changed();
+                                            },
+                                        );
+                                        kit::setting_row(
+                                            ui,
+                                            "Prefer plain text",
+                                            "Show the text version of messages that have both. Switch per message from the More menu.",
+                                            |ui| {
+                                                changed |= kit::switch(ui, &mut s.prefer_plain_text, "Prefer plain text").changed();
+                                            },
+                                        );
+                                    }
+                                    SettingsPage::Privacy => {
+                                        kit::section_title(ui, "Privacy");
+                                        kit::setting_row(
+                                            ui,
+                                            "Load remote images, styles and fonts",
+                                            "Senders can learn when you open a message. When off, you can load them per message.",
+                                            |ui| {
+                                                changed |=
+                                                    kit::switch(ui, &mut s.load_remote_content, "Load remote images, styles and fonts")
+                                                        .changed();
+                                            },
+                                        );
+                                        ui.label(
+                                            RichText::new("Scripts, forms and embedded frames in emails are always blocked.")
+                                                .size(ty::META)
+                                                .color(p.text_secondary),
+                                        );
+                                    }
+                                    SettingsPage::Notifications => {
+                                        kit::section_title(ui, "Notifications");
+                                        kit::setting_row(
+                                            ui,
+                                            "Desktop notifications",
+                                            "For new mail in your inboxes, while Mail isn't focused.",
+                                            |ui| {
+                                                changed |= kit::switch(ui, &mut s.notifications, "Desktop notifications").changed();
+                                            },
+                                        );
+                                        let enabled = s.notifications;
+                                        kit::setting_row(
+                                            ui,
+                                            "Show sender and subject",
+                                            "Turn off to show only that new mail arrived.",
+                                            |ui| {
+                                                changed |= ui
+                                                    .add_enabled_ui(enabled, |ui| {
+                                                        kit::switch(ui, &mut s.notify_preview, "Show sender and subject")
+                                                    })
+                                                    .inner
+                                                    .changed();
+                                            },
+                                        );
+                                        ui.label(
+                                            RichText::new("You can turn notifications off for a single account in Accounts.")
+                                                .size(ty::META)
+                                                .color(p.text_secondary),
+                                        );
+                                    }
+                                    SettingsPage::Sync => {
+                                        kit::section_title(ui, "Sync");
+                                        kit::setting_row(
+                                            ui,
+                                            "Check for new mail every",
+                                            "Used when a server doesn't support push. With push, new mail arrives instantly.",
+                                            |ui| {
+                                                changed |= ui
+                                                    .add(egui::DragValue::new(&mut s.poll_secs).range(15..=3600).suffix(" seconds"))
+                                                    .changed();
+                                            },
+                                        );
+                                        kit::setting_row(
+                                            ui,
+                                            "Messages to keep per folder",
+                                            "How many recent messages each folder downloads (and per “Load older”). Applies after restart.",
+                                            |ui| {
+                                                changed |= ui.add(egui::DragValue::new(&mut s.initial_fetch).range(50..=5000)).changed();
+                                            },
+                                        );
+                                    }
+                                    SettingsPage::Advanced => {
+                                        kit::section_title(ui, "Advanced");
+                                        kit::setting_row(ui, "Send new messages from", "Used in All inboxes and search results.", |ui| {
+                                            let current = accts
+                                                .iter()
+                                                .find(|(id, _)| *id == s.default_account)
+                                                .map(|(_, l)| l.clone())
+                                                .unwrap_or_else(|| "First account".into());
+                                            egui::ComboBox::from_id_salt("default-acct").selected_text(current).width(200.0).show_ui(
+                                                ui,
+                                                |ui| {
+                                                    for (id, label) in &accts {
+                                                        changed |= ui.selectable_value(&mut s.default_account, id.clone(), label).changed();
+                                                    }
+                                                },
+                                            );
+                                        });
+                                        ui.label(RichText::new("OAuth app registrations").font(theme::semibold(ty::UI)).color(p.text));
+                                        ui.label(
+                                            RichText::new("Used when adding Microsoft or Google accounts with browser sign-in.")
+                                                .size(ty::META)
+                                                .color(p.text_secondary),
+                                        );
+                                        ui.add_space(8.0);
+                                        for (label, val, secret) in [
+                                            ("Microsoft client ID", &mut s.microsoft_client_id, false),
+                                            ("Google client ID", &mut s.google_client_id, false),
+                                            ("Google client secret", &mut s.google_client_secret, true),
+                                        ] {
+                                            ui.label(RichText::new(label).size(ty::META).color(p.text_secondary));
+                                            changed |=
+                                                ui.add(kit::text_field(val, "").password(secret).desired_width(f32::INFINITY)).changed();
+                                            ui.add_space(6.0);
+                                        }
+                                        ui.add_space(8.0);
+                                        ui.horizontal(|ui| {
+                                            ui.label(
+                                                RichText::new(format!("Mail data: {}", crate::config::cache_dir().display()))
+                                                    .size(ty::META)
+                                                    .color(p.text_secondary),
+                                            );
+                                            if ui
+                                                .add(egui::Button::new(RichText::new("Open").size(ty::META).color(p.accent)).frame(false))
+                                                .clicked()
+                                            {
+                                                let _ = open::that(crate::config::cache_dir());
+                                            }
+                                        });
+                                    }
+                                    SettingsPage::About => {
+                                        kit::section_title(ui, "About & updates");
+                                        ui.label(
+                                            RichText::new(format!("Mail {}", update::current()))
+                                                .font(theme::semibold(ty::UI))
+                                                .color(p.text),
+                                        );
+                                        ui.add_space(12.0);
+                                        kit::setting_row(
+                                            ui,
+                                            "Install updates automatically",
+                                            "Mail checks GitHub daily and installs updates when you close it.",
+                                            |ui| {
+                                                changed |= kit::switch(ui, &mut s.auto_update, "Install updates automatically").changed();
+                                            },
+                                        );
+                                        ui.horizontal(|ui| {
+                                            let busy = matches!(self.update, UpdateState::Checking | UpdateState::Downloading(_));
+                                            if ui
+                                                .add_enabled_ui(!busy && self.staged.is_none() && update::platform().is_some(), |ui| {
+                                                    kit::secondary_button(ui, "Check for updates")
+                                                })
+                                                .inner
+                                                .clicked()
+                                            {
+                                                update_now = true;
+                                            }
+                                            match &self.update {
+                                                UpdateState::Idle => {}
+                                                UpdateState::Checking => {
+                                                    ui.add(egui::Spinner::new().size(14.0).color(p.text_secondary));
+                                                    ui.label(RichText::new("Checking…").color(p.text_secondary));
+                                                }
+                                                UpdateState::UpToDate => {
+                                                    ui.label(kit::glyph(ic::ICON_CHECK_CIRCLE, 18.0, p.success));
+                                                    ui.label(RichText::new("You're up to date").color(p.text));
+                                                }
+                                                UpdateState::Available(r) => {
+                                                    if kit::primary_button(
+                                                        ui,
+                                                        Some(ic::ICON_SYSTEM_UPDATE),
+                                                        &format!("Install {}", r.version),
+                                                    )
+                                                    .clicked()
+                                                    {
+                                                        install = Some(r.clone());
+                                                    }
+                                                }
+                                                UpdateState::Downloading(v) => {
+                                                    ui.add(egui::Spinner::new().size(14.0).color(p.text_secondary));
+                                                    ui.label(RichText::new(format!("Downloading {v}…")).color(p.text_secondary));
+                                                }
+                                                UpdateState::Ready => {
+                                                    ui.label(kit::glyph(ic::ICON_CHECK_CIRCLE, 18.0, p.success));
+                                                    ui.label(RichText::new("Ready — restart Mail to finish").color(p.text));
+                                                }
+                                                UpdateState::Failed(e) => {
+                                                    ui.label(kit::glyph(ic::ICON_ERROR, 18.0, p.error));
+                                                    ui.add(
+                                                        egui::Label::new(
+                                                            RichText::new(format!("Update failed: {e}")).size(ty::META + 1.0).color(p.text),
+                                                        )
+                                                        .wrap(),
+                                                    );
+                                                }
+                                            }
+                                        });
+                                        ui.add_space(12.0);
+                                        ui.hyperlink_to(
+                                            RichText::new("Release notes ↗").color(p.accent),
+                                            "https://github.com/MattGodwin/mail-rs/releases",
+                                        );
+                                    }
+                                    SettingsPage::Accounts => {
+                                        if let Some(ed) = self.editor.as_mut() {
+                                            save_account = Self::account_detail(ui, ed, &self.cfg.settings, &tx, &mut self.acts);
+                                        } else {
+                                            kit::section_title(ui, "Accounts");
+                                            for (i, a) in self.accts.iter().enumerate().filter(|(_, a)| a.live()) {
+                                                ui.horizontal(|ui| {
+                                                    ui.set_height(52.0);
+                                                    kit::avatar(ui, if a.cfg.name.is_empty() { &a.cfg.email } else { &a.cfg.name }, 32.0);
+                                                    ui.vertical(|ui| {
+                                                        ui.spacing_mut().item_spacing.y = 0.0;
+                                                        ui.label(RichText::new(&a.cfg.email).font(theme::semibold(ty::UI)).color(p.text));
+                                                        let (txt, col) = if a.cfg.paused {
+                                                            ("Paused".to_string(), p.text_secondary)
+                                                        } else {
+                                                            match &a.state {
+                                                                AcctState::Online => (
+                                                                    if a.push { "Connected · push".into() } else { "Connected".into() },
+                                                                    p.success,
+                                                                ),
+                                                                AcctState::Connecting => ("Connecting…".into(), p.text_secondary),
+                                                                AcctState::Offline(_) => ("Offline".into(), p.warning),
+                                                                AcctState::AuthFailed(_) => ("Sign-in failed".into(), p.error),
+                                                            }
+                                                        };
+                                                        ui.label(RichText::new(txt).size(ty::META).color(col));
+                                                    });
+                                                    ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                                                        if kit::secondary_button(ui, "Edit").clicked() {
+                                                            self.acts.push(Action::EditAccount(i));
+                                                        }
+                                                    });
+                                                });
+                                                let r = ui.available_rect_before_wrap();
+                                                ui.painter().hline(r.x_range(), r.top(), Stroke::new(1.0, p.divider));
+                                            }
+                                            ui.add_space(12.0);
+                                            if kit::quiet_button(ui, Some(ic::ICON_PERSON_ADD), "Add account").clicked() {
+                                                self.acts.push(Action::AddAccount);
+                                            }
+                                        }
+                                    }
+                                }
+                            });
+                    });
                 });
-                ui.end_row();
-                ui.label("");
-                changed |= ui.checkbox(&mut s.mark_read_on_open, "Mark messages read when opened").changed();
-                ui.end_row();
-                ui.label("");
-                changed |= ui
-                    .checkbox(&mut s.prefer_plain_text, "Prefer plain text over HTML")
-                    .on_hover_text("Show the text version of messages that have both. You can switch per message from the ⋯ menu.")
-                    .changed();
-                ui.end_row();
-                ui.label("");
-                changed |= ui
-                    .checkbox(&mut s.load_remote_content, "Load remote images automatically")
-                    .on_hover_text("Also allows remote styles and fonts. Senders may learn when you open their messages. Turn off to load remote content per message.")
-                    .changed();
-                ui.end_row();
-                ui.label("");
-                changed |= ui.checkbox(&mut s.notifications, "Desktop notifications for new mail").changed();
-                ui.end_row();
-                ui.label("");
-                changed |= ui.add_enabled(s.notifications, egui::Checkbox::new(&mut s.notify_preview, "Show sender and subject in notifications")).changed();
-                ui.end_row();
             });
-            ui.add_space(6.0);
-            ui.label(RichText::new("OAuth client IDs").strong());
-            ui.add(egui::Label::new(RichText::new("Pre-filled for new Google / Microsoft accounts. The account editor explains how to create them.").small().weak()).wrap());
-            egui::Grid::new("oauth-ids").num_columns(2).spacing([10.0, 6.0]).show(ui, |ui| {
-                ui.label("Google client ID");
-                changed |= ui.add(egui::TextEdit::singleline(&mut s.google_client_id).desired_width(280.0)).changed();
-                ui.end_row();
-                ui.label("Google client secret");
-                changed |= ui.add(egui::TextEdit::singleline(&mut s.google_client_secret).password(true).desired_width(280.0)).changed();
-                ui.end_row();
-                ui.label("Microsoft client ID");
-                changed |= ui.add(egui::TextEdit::singleline(&mut s.microsoft_client_id).desired_width(280.0)).changed();
-                ui.end_row();
-            });
-            ui.add_space(6.0);
-            ui.label(RichText::new("Updates").strong());
-            ui.horizontal_wrapped(|ui| {
-                ui.label(format!("Version {}", update::current()));
-                changed |= ui.checkbox(&mut s.auto_update, "Install updates automatically").changed();
-            });
-            ui.horizontal_wrapped(|ui| {
-                let busy = matches!(self.update, UpdateState::Checking | UpdateState::Downloading(_));
-                if ui.add_enabled(!busy && self.staged.is_none() && update::platform().is_some(), egui::Button::new("Check now")).clicked() {
-                    update_now = true;
+        if modal.should_close() && self.confirm.is_none() {
+            close = true;
+        }
+        if save_account {
+            match self.save_editor() {
+                Ok(()) => {
+                    self.editor = None;
+                    self.status = "Account saved".into();
                 }
-                match &self.update {
-                    UpdateState::Idle => {}
-                    UpdateState::Checking => {
-                        ui.spinner();
-                        ui.label(RichText::new("Checking…").weak());
-                    }
-                    UpdateState::UpToDate => {
-                        ui.label(RichText::new("✔ You're up to date").color(GOOD));
-                    }
-                    UpdateState::Available(r) => {
-                        if ui.button(format!("Install {}", r.version)).clicked() {
-                            install = Some(r.clone());
-                        }
-                    }
-                    UpdateState::Downloading(v) => {
-                        ui.spinner();
-                        ui.label(RichText::new(format!("Downloading {v}…")).weak());
-                    }
-                    UpdateState::Ready => {
-                        ui.label(RichText::new("✔ Update ready: restart Mail to finish").color(GOOD));
-                    }
-                    UpdateState::Failed(e) => {
-                        ui.add(egui::Label::new(RichText::new(format!("Update failed: {e}")).small().color(ui.visuals().warn_fg_color)).wrap());
+                Err(e) => {
+                    if let Some(ed) = self.editor.as_mut() {
+                        ed.error = Some(e);
                     }
                 }
-            });
-            ui.add_space(6.0);
-            ui.label(RichText::new(format!("Data: {}", crate::config::cache_dir().display())).small().weak());
-        });
+            }
+        }
         if update_now {
             let auto = self.cfg.settings.auto_update;
             self.check_updates(auto);
@@ -3589,63 +4881,183 @@ impl App {
                 self.status = e;
             }
         }
-        self.settings_open = open;
+        if close {
+            self.settings_open = false;
+            self.editor = None;
+        }
+    }
+
+    /// Settings › Accounts › one account. Returns true when "Save changes" is pressed.
+    fn account_detail(
+        ui: &mut egui::Ui,
+        ed: &mut Editor,
+        settings: &crate::config::Settings,
+        tx: &Sender<Event>,
+        acts: &mut Vec<Action>,
+    ) -> bool {
+        let p = kit::pal(ui);
+        let mut save = false;
+        ui.horizontal(|ui| {
+            if kit::icon_button(ui, ic::ICON_ARROW_BACK, "All accounts").clicked() {
+                ui.memory_mut(|m| m.data.insert_temp(Id::unique("acct-back"), true));
+            }
+            ui.label(RichText::new(&ed.email).font(theme::semibold(ty::HEADING)).color(p.text));
+        });
+        ui.add_space(12.0);
+        let group = |ui: &mut egui::Ui, title: &str| {
+            ui.add_space(8.0);
+            ui.label(RichText::new(title).font(theme::semibold(ty::UI)).color(p.text));
+            ui.add_space(6.0);
+        };
+        group(ui, "Identity");
+        ui.label(RichText::new("Your name").size(ty::META).color(p.text_secondary));
+        ui.add(kit::text_field(&mut ed.name, "").desired_width(f32::INFINITY));
+        ui.add_space(6.0);
+        ui.label(RichText::new("Sending aliases — one per line, e.g. Jane Doe <jane@work.example>").size(ty::META).color(p.text_secondary));
+        ui.add(egui::TextEdit::multiline(&mut ed.aliases).desired_rows(2).desired_width(f32::INFINITY).margin(egui::Margin::same(8)));
+        group(ui, "Signature");
+        ui.add(egui::TextEdit::multiline(&mut ed.signature).desired_rows(3).desired_width(f32::INFINITY).margin(egui::Margin::same(8)));
+        group(ui, "Notifications");
+        ui.horizontal(|ui| {
+            kit::switch(ui, &mut ed.notify, "Notify me about new mail in this account");
+            ui.label(RichText::new("Notify me about new mail in this account").color(p.text));
+        });
+        group(ui, "Sign-in");
+        let mut show = false;
+        Self::signin_controls(ui, ed, &mut show, settings, tx);
+        group(ui, "Servers");
+        Self::server_form(ui, ed);
+        ui.add_space(6.0);
+        ui.horizontal(|ui| {
+            kit::switch(ui, &mut ed.save_sent, "Save a copy of sent mail to Sent");
+            ui.label(RichText::new("Save a copy of sent mail to Sent").color(p.text))
+                .on_hover_text("Gmail and Outlook do this automatically; leave off for them.");
+        });
+        if let Some(e) = &ed.error {
+            ui.add_space(8.0);
+            kit::notice(ui, Tone::Error, e, None);
+        }
+        ui.add_space(16.0);
+        ui.horizontal(|ui| {
+            if kit::primary_button(ui, None, "Save changes").clicked() {
+                save = true;
+            }
+            if let Some(i) = ed.editing {
+                ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                    if ui.add(egui::Button::new(RichText::new("Remove account…").color(p.error)).frame(false)).clicked() {
+                        acts.push(Action::RemoveAccount(i));
+                    }
+                });
+            }
+        });
+        if ui.memory_mut(|m| m.data.remove_temp::<bool>(Id::unique("acct-back"))).unwrap_or(false) {
+            acts.push(Action::CloseAccountDetail);
+        }
+        save
     }
 
     fn ui_dialogs(&mut self, ctx: &egui::Context) {
+        let p = theme::palette(ctx);
         if let Some((title, src)) = &self.source {
-            let mut open = true;
-            egui::Window::new(format!("Source — {title}")).id(Id::unique("source")).open(&mut open).default_size([760.0, 560.0]).show(
-                ctx,
-                |ui| {
-                    egui::ScrollArea::both().auto_shrink([false, false]).show(ui, |ui| {
-                        ui.add(egui::Label::new(RichText::new(src).monospace()).extend().selectable(true));
+            let mut close = false;
+            let screen = ctx.content_rect();
+            let r = egui::Modal::new(Id::unique("source-modal")).frame(kit::dialog_frame(ctx)).show(ctx, |ui| {
+                let size = egui::vec2((screen.width() - 96.0).min(900.0), (screen.height() - 120.0).min(640.0));
+                ui.set_width(size.x);
+                ui.horizontal(|ui| {
+                    ui.label(kit::glyph(ic::ICON_CODE, 20.0, p.text_secondary));
+                    let g = kit::one_line(ui, format!("Source · {title}"), theme::semibold(ty::HEADING), p.text, size.x - 80.0);
+                    ui.label(g);
+                    ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                        if kit::icon_button(ui, ic::ICON_CLOSE, "Close (Esc)").clicked() {
+                            close = true;
+                        }
                     });
-                },
-            );
-            if !open {
+                });
+                ui.add_space(12.0);
+                egui::Frame::new()
+                    .fill(p.input)
+                    .stroke(Stroke::new(1.0, p.divider))
+                    .corner_radius(egui::CornerRadius::same(6))
+                    .inner_margin(egui::Margin::same(12))
+                    .show(ui, |ui| {
+                        egui::ScrollArea::both().max_height(size.y - 80.0).auto_shrink([false, false]).show(ui, |ui| {
+                            ui.add(
+                                egui::Label::new(RichText::new(src).font(FontId::monospace(ty::MONO)).color(p.text))
+                                    .extend()
+                                    .selectable(true),
+                            );
+                        });
+                    });
+            });
+            if close || r.should_close() {
                 self.source = None;
             }
         }
         if self.shortcuts_open {
-            let mut open = true;
-            egui::Window::new("Keyboard shortcuts").id(Id::unique("shortcuts")).open(&mut open).collapsible(false).resizable(false).show(
-                ctx,
-                |ui| {
-                    egui::Grid::new("sc").num_columns(2).spacing([16.0, 4.0]).show(ui, |ui| {
-                        for (k, d) in SHORTCUTS {
-                            ui.label(RichText::new(*k).monospace());
-                            ui.label(*d);
-                            ui.end_row();
+            let r = egui::Modal::new(Id::unique("shortcuts-modal")).frame(kit::dialog_frame(ctx)).show(ctx, |ui| {
+                ui.set_width(460.0);
+                ui.horizontal(|ui| {
+                    ui.label(RichText::new("Keyboard shortcuts").font(theme::semibold(ty::HEADING)).color(p.text));
+                    ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                        if kit::icon_button(ui, ic::ICON_CLOSE, "Close (Esc)").clicked() {
+                            self.shortcuts_open = false;
                         }
                     });
-                },
-            );
-            self.shortcuts_open = open;
+                });
+                ui.add_space(12.0);
+                egui::Grid::new("sc").num_columns(2).spacing([24.0, 10.0]).show(ui, |ui| {
+                    for (k, d) in SHORTCUTS {
+                        ui.horizontal(|ui| {
+                            ui.spacing_mut().item_spacing.x = 4.0;
+                            for part in k.split(", ") {
+                                egui::Frame::new()
+                                    .fill(p.input)
+                                    .stroke(Stroke::new(1.0, p.divider))
+                                    .corner_radius(egui::CornerRadius::same(4))
+                                    .inner_margin(egui::Margin::symmetric(6, 2))
+                                    .show(ui, |ui| {
+                                        ui.label(RichText::new(part).font(FontId::monospace(ty::META)).color(p.text));
+                                    });
+                            }
+                        });
+                        ui.label(RichText::new(*d).color(p.text));
+                        ui.end_row();
+                    }
+                });
+            });
+            if r.should_close() {
+                self.shortcuts_open = false;
+            }
         }
 
-        // Three-way prompt for closing a compose window with unsaved changes.
+        // Closing a compose window with unsaved changes: Save draft / Discard draft / Cancel.
         if let Some(Confirm::CloseCompose(id)) = &self.confirm {
             let id = *id;
             let mut choice = None;
-            egui::Window::new("Unsaved message").collapsible(false).resizable(false).anchor(Align2::CENTER_CENTER, Vec2::ZERO).show(
-                ctx,
-                |ui| {
-                    ui.label("Save this message as a draft before closing?");
-                    ui.add_space(8.0);
-                    ui.horizontal(|ui| {
-                        if ui.add(egui::Button::new(RichText::new("Save draft").color(Color32::WHITE)).fill(ACCENT)).clicked() {
+            let r = egui::Modal::new(Id::unique("close-compose")).frame(kit::dialog_frame(ctx)).show(ctx, |ui| {
+                ui.set_width(400.0);
+                ui.label(RichText::new("Save this message?").font(theme::semibold(ty::HEADING)).color(p.text));
+                ui.add_space(8.0);
+                ui.add(egui::Label::new(RichText::new("Save it to Drafts to finish later, or discard it.").color(p.text_secondary)).wrap());
+                ui.add_space(20.0);
+                ui.horizontal(|ui| {
+                    if ui.add(egui::Button::new(RichText::new("Discard draft").color(p.error)).frame(false)).clicked() {
+                        choice = Some(2);
+                    }
+                    ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                        if kit::primary_button(ui, None, "Save draft").clicked() {
                             choice = Some(1);
                         }
-                        if ui.button("Discard").clicked() {
-                            choice = Some(2);
-                        }
-                        if ui.button("Cancel").clicked() || ui.input(|i| i.key_pressed(K::Escape)) {
+                        if kit::secondary_button(ui, "Cancel").clicked() {
                             choice = Some(0);
                         }
                     });
-                },
-            );
+                });
+            });
+            if r.should_close() && choice.is_none() {
+                choice = Some(0);
+            }
             match choice {
                 Some(1) => {
                     self.confirm = None;
@@ -3663,32 +5075,39 @@ impl App {
 
         let mut decision = None;
         if let Some(c) = &self.confirm {
-            let (title, text) = match c {
+            let (title, text, action) = match c {
                 Confirm::RemoveAccount(i) => (
+                    format!("Remove {}?", self.accts.get(*i).map(|a| a.cfg.label()).unwrap_or("this account")),
+                    "Its downloaded mail and saved sign-in are removed from this computer. Nothing is deleted on the server, and you can add it again later.".to_string(),
                     "Remove account",
-                    format!(
-                        "Remove {} from this app? Its local cache and saved credentials are deleted. Nothing is deleted on the server. Open messages from this account move to another account.",
-                        self.accts.get(*i).map(|a| a.cfg.label()).unwrap_or("")
-                    ),
                 ),
-                Confirm::DeleteForever(keys) => ("Delete permanently", format!("Permanently delete {} message(s)? This cannot be undone.", keys.len())),
+                Confirm::DeleteForever(keys) => (
+                    if keys.len() == 1 { "Delete permanently?".to_string() } else { format!("Delete {} messages permanently?", keys.len()) },
+                    "This can't be undone.".to_string(),
+                    "Delete permanently",
+                ),
                 Confirm::CloseCompose(_) => unreachable!(),
             };
-            egui::Window::new(title).collapsible(false).resizable(false).anchor(Align2::CENTER_CENTER, Vec2::ZERO).show(ctx, |ui| {
-                ui.add(egui::Label::new(text).wrap());
+            let r = egui::Modal::new(Id::unique("confirm")).frame(kit::dialog_frame(ctx)).show(ctx, |ui| {
+                ui.set_width(400.0);
+                ui.label(RichText::new(&title).font(theme::semibold(ty::HEADING)).color(p.text));
                 ui.add_space(8.0);
+                ui.add(egui::Label::new(RichText::new(&text).color(p.text_secondary)).wrap());
+                ui.add_space(20.0);
                 ui.horizontal(|ui| {
-                    if ui
-                        .add(egui::Button::new(RichText::new("Confirm").color(Color32::WHITE)).fill(Color32::from_rgb(0xdc, 0x26, 0x26)))
-                        .clicked()
-                    {
-                        decision = Some(true);
-                    }
-                    if ui.button("Cancel").clicked() || ui.input(|i| i.key_pressed(K::Escape)) {
-                        decision = Some(false);
-                    }
+                    ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                        if kit::danger_button(ui, action).clicked() {
+                            decision = Some(true);
+                        }
+                        if kit::secondary_button(ui, "Cancel").clicked() {
+                            decision = Some(false);
+                        }
+                    });
                 });
             });
+            if r.should_close() && decision.is_none() {
+                decision = Some(false);
+            }
         }
         if let Some(yes) = decision {
             let c = self.confirm.take().unwrap();
@@ -3706,21 +5125,32 @@ impl App {
     }
 
     fn ui_quitting(&mut self, ctx: &egui::Context) {
+        let p = theme::palette(ctx);
         let n = self.outstanding();
-        egui::Window::new("Finishing up").collapsible(false).resizable(false).anchor(Align2::CENTER_CENTER, Vec2::ZERO).show(ctx, |ui| {
+        egui::Modal::new(Id::unique("quitting")).frame(kit::dialog_frame(ctx)).show(ctx, |ui| {
+            ui.set_width(400.0);
             ui.horizontal(|ui| {
-                ui.spinner();
-                ui.label(format!("Waiting for {n} change(s) to reach the server…"));
+                ui.add(egui::Spinner::new().size(18.0).color(p.text_secondary));
+                ui.label(RichText::new("Finishing up").font(theme::semibold(ty::HEADING)).color(p.text));
             });
             ui.add_space(8.0);
+            ui.add(
+                egui::Label::new(
+                    RichText::new(format!("Waiting for {n} change(s) to reach the server before Mail closes.")).color(p.text_secondary),
+                )
+                .wrap(),
+            );
+            ui.add_space(20.0);
             ui.horizontal(|ui| {
-                if ui.button("Quit anyway").on_hover_text("Unfinished changes may not be saved on the server").clicked() {
-                    self.force_quit = true;
-                    ctx.send_viewport_cmd(egui::ViewportCommand::Close);
-                }
-                if ui.button("Keep the app open").clicked() {
-                    self.quitting = false;
-                }
+                ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                    if kit::danger_button(ui, "Quit anyway").on_hover_text("Unfinished changes may not reach the server").clicked() {
+                        self.force_quit = true;
+                        ctx.send_viewport_cmd(egui::ViewportCommand::Close);
+                    }
+                    if kit::secondary_button(ui, "Keep open").clicked() {
+                        self.quitting = false;
+                    }
+                });
             });
         });
     }
@@ -3836,13 +5266,43 @@ impl eframe::App for App {
             self.rebuild_rows();
         }
         self.update_title();
+        // TEMP demo hook
+        static N: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+        let n = N.fetch_add(1, Ordering::Relaxed);
+        if let Ok(i) = std::env::var("MAIL_DEMO_OPEN") {
+            if n == 8 {
+                if let Some(r) = self.rows.get(i.parse::<usize>().unwrap_or(0)) {
+                    let k = r.key.clone();
+                    self.open(k);
+                }
+            }
+            if n == 20 {
+                match std::env::var("MAIL_DEMO_PANEL").as_deref() {
+                    Ok("settings") => self.settings_open = true,
+                    Ok("editor") => self.open_editor(None),
+                    Ok("compose") => self.reply(false),
+                    Ok("accounts") => {
+                        self.settings_open = true;
+                        self.settings_page = SettingsPage::Accounts;
+                    }
+                    Ok("privacy") => {
+                        self.settings_open = true;
+                        self.settings_page = SettingsPage::Privacy;
+                    }
+                    _ => {}
+                }
+            }
+            if n < 80 {
+                ctx.request_repaint();
+            }
+        }
     }
 
     fn ui(&mut self, ui: &mut egui::Ui, frame: &mut eframe::Frame) {
         let ctx = ui.ctx().clone();
+        self.track_status();
         self.ui_top(ui);
         self.ui_update_banner(ui);
-        self.ui_status(ui);
         self.ui_folders(ui);
         self.ui_list(ui);
         self.ui_reader(ui);

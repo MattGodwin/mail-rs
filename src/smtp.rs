@@ -7,7 +7,7 @@ use lettre::transport::smtp::client::{Tls, TlsParameters};
 use lettre::{SmtpTransport, Transport};
 use std::time::Duration;
 
-pub fn send(acct: &Account, msg: &lettre::Message) -> Result<(), String> {
+fn transport(acct: &Account) -> Result<SmtpTransport, String> {
     let host = acct.smtp.host.trim().to_string();
     let tls = TlsParameters::new(host.clone()).map_err(|e| format!("TLS setup failed: {e}"))?;
     let (creds, mechanisms) = match acct.auth {
@@ -28,5 +28,18 @@ pub fn send(acct: &Account, msg: &lettre::Message) -> Result<(), String> {
         .authentication(mechanisms)
         .timeout(Some(Duration::from_secs(60)))
         .build();
-    transport.send(msg).map(|_| ()).map_err(|e| format!("Sending failed: {e}"))
+    Ok(transport)
+}
+
+pub fn send(acct: &Account, msg: &lettre::Message) -> Result<(), String> {
+    transport(acct)?.send(msg).map(|_| ()).map_err(|e| format!("Sending failed: {e}"))
+}
+
+/// Connect and sign in to the outgoing server without sending anything.
+pub fn verify(acct: &Account) -> Result<(), String> {
+    match transport(acct)?.test_connection() {
+        Ok(true) => Ok(()),
+        Ok(false) => Err("The outgoing server closed the connection".into()),
+        Err(e) => Err(e.to_string()),
+    }
 }
