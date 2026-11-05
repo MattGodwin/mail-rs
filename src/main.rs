@@ -49,8 +49,8 @@ fn error_dialog(title: &str, text: &str) {
         .show();
 }
 
-/// A crash should never look like "nothing happened": log it, and tell the
-/// user if the UI thread is the one that crashed.
+/// Log Rust panics and show an error for UI thread panics. Native driver
+/// access violations terminate the process without invoking this hook.
 fn install_panic_hook() {
     let default = std::panic::take_hook();
     std::panic::set_hook(Box::new(move |info| {
@@ -70,10 +70,12 @@ fn install_panic_hook() {
 const RENDERER_ENV: &str = "MAIL_RENDERER";
 
 fn renderer_file() -> std::path::PathBuf {
-    config::cache_dir().join("renderer")
+    // Reset the old Windows OpenGL preference: it may have been selected to
+    // avoid the Vulkan driver that earlier versions initialized by default.
+    config::cache_dir().join(if cfg!(windows) { "renderer-dx12" } else { "renderer" })
 }
 
-/// Direct3D/Metal/Vulkan via wgpu by default; OpenGL if that failed before
+/// Direct3D 12 on Windows, platform defaults elsewhere; OpenGL if that failed before
 /// on this computer (or MAIL_RENDERER=glow).
 fn choose_renderer() -> Renderer {
     let pref = std::env::var(RENDERER_ENV).ok().or_else(|| std::fs::read_to_string(renderer_file()).ok());
@@ -83,9 +85,27 @@ fn choose_renderer() -> Renderer {
     }
 }
 
+fn wgpu_options() -> eframe::WgpuConfiguration {
+    let config = eframe::WgpuConfiguration::default();
+    #[cfg(windows)]
+    {
+        let mut config = config;
+        if let eframe::egui_wgpu::WgpuSetup::CreateNew(setup) = &mut config.wgpu_setup {
+            // Restrict the instance itself, not just adapter selection. Enumerating
+            // Vulkan adapters can crash inside older Intel igvk64.dll drivers,
+            // before wgpu can return an error or choose a Direct3D adapter.
+            setup.instance_descriptor.backends = eframe::wgpu::Backends::DX12;
+        }
+        config
+    }
+    #[cfg(not(windows))]
+    config
+}
+
 fn run(renderer: Renderer) -> eframe::Result {
     let options = eframe::NativeOptions {
         renderer,
+        wgpu_options: wgpu_options(),
         viewport: eframe::egui::ViewportBuilder::default()
             .with_title("Mail")
             .with_app_id("mail-rs")
@@ -116,6 +136,10 @@ fn main() {
     update::cleanup();
     let renderer = choose_renderer();
     log_problem(&format!("starting with the {renderer} renderer"));
+    #[cfg(windows)]
+    if renderer == Renderer::Wgpu {
+        log_problem("enabled graphics backend: Direct3D 12 only (Vulkan disabled)");
+    }
     let Err(e) = run(renderer) else { return };
     log_problem(&format!("could not start with the {renderer} renderer: {e}"));
     // A window system can only be started once per process, so retry the
@@ -133,4 +157,15 @@ fn main() {
         &format!("Mail couldn't open its window on this computer.\n\n{e}\n\nDetails were saved to {}", crash_log().display()),
     );
     std::process::exit(1);
+}
+
+#[cfg(all(test, windows))]
+mod startup_tests {
+    #[test]
+    fn windows_instance_enables_only_direct3d12() {
+        let eframe::egui_wgpu::WgpuSetup::CreateNew(setup) = super::wgpu_options().wgpu_setup else {
+            panic!("startup must create its own graphics instance");
+        };
+        assert_eq!(setup.instance_descriptor.backends, eframe::wgpu::Backends::DX12);
+    }
 }

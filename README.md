@@ -153,6 +153,11 @@ If an older release does nothing when opened, install the latest version again.
 Starting with v0.1.1, Windows builds include the C runtime and do not require a
 separate Visual C++ Redistributable installation. If the default graphics renderer
 fails, Mail retries with OpenGL and remembers it after successful initialization.
+Starting with v0.1.2, Windows uses Direct3D 12 exclusively for its wgpu renderer,
+avoiding Vulkan initialization crashes in older Intel graphics drivers. Earlier
+remembered Windows OpenGL preferences are reset; `MAIL_RENDERER=glow` still
+selects OpenGL explicitly. Native driver access violations cannot be caught by
+the Rust panic logger or the renderer error fallback.
 
 Startup diagnostics and Rust panics are recorded in
 `%LOCALAPPDATA%\mail-rs\cache\crash.log`. If the app still cannot open, include
