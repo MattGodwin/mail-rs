@@ -3,8 +3,10 @@
 //! The raw bytes are kept untouched alongside the parsed view; anything the
 //! user saves, forwards or opens comes from those original bytes.
 
+use crate::formats::{self, Invite, Notice};
 use crate::model;
 use mail_parser::{AddressList, Mailbox, MessageParser, PartId, PartKind};
+use std::collections::HashMap;
 use std::sync::Arc;
 
 pub struct Attachment {
@@ -12,6 +14,14 @@ pub struct Attachment {
     pub mime: String,
     pub size: usize,
     pub part: PartId,
+    /// An attached email (message/rfc822) that can be opened in the reader.
+    pub is_message: bool,
+    /// An image the reader can preview.
+    pub is_image: bool,
+}
+
+pub fn previewable_image(mime: &str) -> bool {
+    matches!(mime, "image/png" | "image/jpeg" | "image/jpg" | "image/pjpeg" | "image/gif" | "image/webp" | "image/bmp")
 }
 
 /// A run of body text: plain text, or a line containing clickable links.
@@ -38,7 +48,16 @@ pub struct View {
     pub blocks: Vec<Block>,
     pub html: Option<String>,
     pub from_html: bool,
+    /// The HTML references remote images/styles/fonts (blocked by default).
+    pub remote_content: bool,
+    /// Inline parts by Content-ID (lowercase, no angle brackets): (mime, part).
+    pub cids: HashMap<String, (String, PartId)>,
     pub attachments: Vec<Attachment>,
+    /// A calendar invitation and its raw .ics data.
+    pub invite: Option<(Invite, Vec<u8>)>,
+    pub notices: Vec<Notice>,
+    /// List-Unsubscribe targets (https: or mailto:).
+    pub unsubscribe: Vec<String>,
     pub raw: Arc<Vec<u8>>,
 }
 
@@ -81,7 +100,12 @@ pub fn parse(raw: Arc<Vec<u8>>) -> View {
             text,
             html: None,
             from_html: false,
+            remote_content: false,
+            cids: HashMap::new(),
             attachments: vec![],
+            invite: None,
+            notices: vec![],
+            unsubscribe: vec![],
             raw,
         };
     };
@@ -99,19 +123,33 @@ pub fn parse(raw: Arc<Vec<u8>>) -> View {
         }
     };
 
-    // Body: prefer a real text/plain part. Fall back to a text rendering of
-    // the HTML part. Nothing remote is ever fetched.
+    let mime_of = |ct: Option<mail_parser::ContentType>| {
+        ct.map(|ct| match ct.subtype() {
+            Some(st) => format!("{}/{}", ct.ctype(), st),
+            None => ct.ctype().to_string(),
+        })
+        .unwrap_or_else(|| "text/plain".into())
+        .to_ascii_lowercase()
+    };
+
+    // Body: prefer a real text/plain part (reflowing format=flowed text).
+    // HTML is kept separately for the web view; nothing remote is fetched.
     let mut text = String::new();
     let mut has_plain = false;
     for p in msg.text_body() {
-        if matches!(p.kind(), PartKind::Text) {
-            if let Some(t) = p.text() {
-                if !text.is_empty() {
-                    text.push_str("\n\n");
-                }
-                text.push_str(&t);
-                has_plain = true;
+        if !matches!(p.kind(), PartKind::Text) || mime_of(p.content_type()) == "text/calendar" {
+            continue;
+        }
+        if let Some(t) = p.text() {
+            let ct = p.content_type();
+            let flowed = ct.as_ref().and_then(|c| c.attribute("format")).is_some_and(|f| f.eq_ignore_ascii_case("flowed"));
+            let delsp = ct.as_ref().and_then(|c| c.attribute("delsp")).is_some_and(|f| f.eq_ignore_ascii_case("yes"));
+            let t = if flowed { formats::unflow(&t, delsp) } else { t.into_owned() };
+            if !text.is_empty() {
+                text.push_str("\n\n");
             }
+            text.push_str(&t);
+            has_plain = true;
         }
     }
     let html = msg.html_body().find(|p| matches!(p.kind(), PartKind::Html)).and_then(|p| p.text()).map(|h| h.into_owned());
@@ -128,24 +166,61 @@ pub fn parse(raw: Arc<Vec<u8>>) -> View {
         text = text.replace("\r\n", "\n");
     }
 
+    // Inline parts, calendar data and formats that need explaining.
+    let mut cids = HashMap::new();
+    let mut invite = None;
+    let mut notices = Vec::new();
+    for p in msg.parts() {
+        let ct = p.content_type();
+        let mime = mime_of(ct.clone());
+        if let Some(id) = p.content_id() {
+            cids.insert(crate::html::cid_key(id), (mime.clone(), p.id()));
+        }
+        if mime == "text/calendar" && invite.is_none() {
+            let data = p.decoded().into_owned();
+            if let Some(inv) = formats::parse_invite(&String::from_utf8_lossy(&data)) {
+                invite = Some((inv, data));
+            }
+        }
+        let protocol = ct.as_ref().and_then(|c| c.attribute("protocol"));
+        let smime = ct.as_ref().and_then(|c| c.attribute("smime-type"));
+        let tnef_name = p.attachment_name().is_some_and(|n| n.eq_ignore_ascii_case("winmail.dat"));
+        let notice = if tnef_name { Some(Notice::Tnef) } else { formats::notice_for(&mime, protocol, smime) };
+        if let Some(n) = notice {
+            if !notices.contains(&n) {
+                notices.push(n);
+            }
+        }
+    }
+    if text.contains("-----BEGIN PGP MESSAGE-----") && !notices.iter().any(|n| matches!(n, Notice::Encrypted(_))) {
+        notices.push(Notice::Encrypted("PGP"));
+    } else if text.contains("-----BEGIN PGP SIGNED MESSAGE-----") && !notices.iter().any(|n| matches!(n, Notice::Signed(_))) {
+        notices.push(Notice::Signed("PGP"));
+    }
+
     let attachments = msg
         .attachments()
         .map(|p| {
-            let mime = p
-                .content_type()
-                .map(|ct| match ct.subtype() {
-                    Some(st) => format!("{}/{}", ct.ctype(), st),
-                    None => ct.ctype().to_string(),
-                })
-                .unwrap_or_else(|| "application/octet-stream".into())
-                .to_ascii_lowercase();
+            let mime = mime_of(p.content_type());
+            let mime = if p.content_type().is_none() { "application/octet-stream".to_string() } else { mime };
+            let is_message = matches!(p.kind(), PartKind::Message(_));
             let name = p.attachment_name().map(model::one_line).unwrap_or_else(|| match p.kind() {
                 PartKind::Message(m) => format!("{}.eml", m.subject().map(sanitize_filename).unwrap_or_else(|| "message".into())),
                 _ => format!("attachment-{}", p.id()),
             });
-            Attachment { name, mime, size: p.decoded_len(), part: p.id() }
+            Attachment { is_image: previewable_image(&mime), name, mime, size: p.decoded_len(), part: p.id(), is_message }
         })
         .collect();
+
+    let unsubscribe = msg
+        .list_unsubscribe()
+        .map(|l| {
+            l.mailboxes()
+                .filter_map(|m| m.address().map(|a| a.trim().to_string()))
+                .filter(|u| u.starts_with("https://") || u.starts_with("http://") || u.starts_with("mailto:"))
+                .collect()
+        })
+        .unwrap_or_default();
 
     View {
         subject: model::one_line(msg.subject().unwrap_or("(no subject)")),
@@ -161,9 +236,14 @@ pub fn parse(raw: Arc<Vec<u8>>) -> View {
         bcc_list,
         blocks: linkify(&text),
         text,
+        remote_content: html.as_deref().is_some_and(crate::html::has_remote_content),
         html,
         from_html,
+        cids,
         attachments,
+        invite,
+        notices,
+        unsubscribe,
         raw: raw.clone(),
     }
 }

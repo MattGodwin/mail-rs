@@ -5,6 +5,8 @@ mod app;
 mod compose;
 mod config;
 mod drafts;
+mod formats;
+mod html;
 mod http;
 mod model;
 mod net;
