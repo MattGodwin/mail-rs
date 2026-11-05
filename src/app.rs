@@ -3687,6 +3687,7 @@ impl App {
     }
 
     /// Every dialog that dims the window (the native email view is hidden behind these).
+    #[cfg_attr(not(any(windows, target_os = "macos")), allow(dead_code))]
     fn any_modal_open(&self) -> bool {
         self.settings_open
             || self.setup.is_some()

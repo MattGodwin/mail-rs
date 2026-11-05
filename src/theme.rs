@@ -3,7 +3,6 @@
 //! a `Palette`, so both themes stay consistent.
 
 use eframe::egui::{self, Color32, CornerRadius, FontFamily, FontId, Shadow, Stroke, Theme};
-use std::sync::Arc;
 
 #[derive(Clone, Copy, Debug)]
 pub struct Palette {
@@ -198,9 +197,11 @@ fn style(p: &Palette, style: &mut egui::Style) {
 /// font registered as a fallback so icons render inline with text.
 pub fn install_fonts(ctx: &egui::Context) {
     let mut fonts = egui::FontDefinitions::default();
+    #[allow(unused_mut)] // only assigned on Windows
     let mut semibold_face = None;
     #[cfg(windows)]
     {
+        use std::sync::Arc;
         let dir = std::path::PathBuf::from(std::env::var("WINDIR").unwrap_or_else(|_| "C:\\Windows".into())).join("Fonts");
         let load = |f: &str| std::fs::read(dir.join(f)).ok();
         if let Some(b) = load("segoeui.ttf") {
