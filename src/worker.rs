@@ -208,6 +208,14 @@ pub enum Ev {
         uid: u32,
     },
     Update(crate::update::Msg),
+    /// A link clicked in the HTML view.
+    Link(String),
+    /// A decoded image-attachment preview for the reader.
+    Preview {
+        seq: u64,
+        part: u32,
+        image: Option<egui::ColorImage>,
+    },
 }
 
 pub struct Event {

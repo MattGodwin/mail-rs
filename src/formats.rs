@@ -87,13 +87,14 @@ fn ics_lines(ics: &str) -> Vec<(String, String, String)> {
             let colon = {
                 // The first ':' not inside a quoted parameter value.
                 let mut q = false;
-                l.char_indices().find(|&(_, c)| {
-                    if c == '"' {
-                        q = !q;
-                    }
-                    c == ':' && !q
-                })?
-                .0
+                l.char_indices()
+                    .find(|&(_, c)| {
+                        if c == '"' {
+                            q = !q;
+                        }
+                        c == ':' && !q
+                    })?
+                    .0
             };
             let (head, value) = (&l[..colon], &l[colon + 1..]);
             let (name, params) = head.split_once(';').unwrap_or((head, ""));

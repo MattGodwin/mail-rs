@@ -132,7 +132,12 @@ mod imp {
                         return respond(StatusCode::NOT_FOUND, "text/plain", vec![], None);
                     };
                     if rest.is_empty() {
-                        return respond(StatusCode::OK, "text/html; charset=utf-8", page.html.clone().into_bytes(), Some(csp(page.allow_remote)));
+                        return respond(
+                            StatusCode::OK,
+                            "text/html; charset=utf-8",
+                            page.html.clone().into_bytes(),
+                            Some(csp(page.allow_remote)),
+                        );
                     }
                     if let Some(cid) = rest.strip_prefix("cid/") {
                         let cid = percent_encoding::percent_decode_str(cid).decode_utf8_lossy();
@@ -180,7 +185,9 @@ mod imp {
             let b = (x, y, w.max(1), h.max(1));
             if self.bounds != Some(b) {
                 self.bounds = Some(b);
-                let _ = self.webview.set_bounds(Rect { position: PhysicalPosition::new(b.0, b.1).into(), size: PhysicalSize::new(b.2, b.3).into() });
+                let _ = self
+                    .webview
+                    .set_bounds(Rect { position: PhysicalPosition::new(b.0, b.1).into(), size: PhysicalSize::new(b.2, b.3).into() });
             }
         }
 

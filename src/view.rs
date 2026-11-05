@@ -157,7 +157,9 @@ pub fn parse(raw: Arc<Vec<u8>>) -> View {
     if !has_plain {
         if let Some(h) = &html {
             // If conversion fails, fall back to mail-parser's simpler HTML-to-text.
-            text = html2text::from_read(h.as_bytes(), 110).unwrap_or_else(|_| msg.body_text(0).map(|t| t.into_owned()).unwrap_or_default());
+            text = html2text::config::plain_no_decorate()
+                .string_from_read(h.as_bytes(), 110)
+                .unwrap_or_else(|_| msg.body_text(0).map(|t| t.into_owned()).unwrap_or_default());
             from_html = true;
         }
     }
@@ -172,7 +174,7 @@ pub fn parse(raw: Arc<Vec<u8>>) -> View {
     let mut notices = Vec::new();
     for p in msg.parts() {
         let ct = p.content_type();
-        let mime = mime_of(ct.clone());
+        let mime = mime_of(ct);
         if let Some(id) = p.content_id() {
             cids.insert(crate::html::cid_key(id), (mime.clone(), p.id()));
         }
@@ -198,8 +200,12 @@ pub fn parse(raw: Arc<Vec<u8>>) -> View {
         notices.push(Notice::Signed("PGP"));
     }
 
+    // Inline images already shown by the HTML aren't listed again as attachments.
+    let html_lower = html.as_deref().unwrap_or("").to_ascii_lowercase();
+    let shown_inline = |id: &str| !html_lower.is_empty() && html_lower.contains(&format!("cid:{}", crate::html::cid_key(id)));
     let attachments = msg
         .attachments()
+        .filter(|p| !p.content_id().is_some_and(shown_inline))
         .map(|p| {
             let mime = mime_of(p.content_type());
             let mime = if p.content_type().is_none() { "application/octet-stream".to_string() } else { mime };

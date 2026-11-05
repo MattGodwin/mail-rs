@@ -108,6 +108,8 @@ pub struct Settings {
     pub default_account: String,
     /// Download and install new releases automatically.
     pub auto_update: bool,
+    /// Show the plain-text version of messages instead of HTML when both exist.
+    pub prefer_plain_text: bool,
 }
 
 impl Default for Settings {
@@ -123,6 +125,7 @@ impl Default for Settings {
             notify_preview: true,
             default_account: String::new(),
             auto_update: true,
+            prefer_plain_text: false,
         }
     }
 }

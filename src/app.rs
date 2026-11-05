@@ -254,6 +254,13 @@ enum Action {
     RequestClose(u64),
     CloseNow(u64),
     Move(i32),
+    Back,
+    ToggleHtml(Key),
+    AllowRemote(Key),
+    OpenNested(usize),
+    AddToCalendar,
+    SaveIcs,
+    Unsubscribe,
 }
 
 pub struct App {
@@ -304,7 +311,27 @@ pub struct App {
     started: Instant,
     last_update_check: Option<Instant>,
     restart_requested: bool,
+    /// Attached emails opened on top of the selected one.
+    nested: Vec<View>,
+    /// Bumped whenever the message on screen changes.
+    view_seq: u64,
+    previews: HashMap<(u64, mail_parser::PartId), Preview>,
+    /// Messages whose remote content the user allowed (this session).
+    remote_ok: HashSet<Key>,
+    /// Messages shown in the non-default (HTML vs text) mode.
+    text_toggle: HashSet<Key>,
+    fonts_loaded: HashSet<&'static str>,
+    #[cfg(any(windows, target_os = "macos"))]
+    html_view: Option<crate::html::HtmlView>,
+    html_error: Option<String>,
+    html_target: Option<(Rect, u64)>,
     acts: Vec<Action>,
+}
+
+enum Preview {
+    Loading,
+    Ready(egui::TextureHandle),
+    Failed,
 }
 
 // ---------------------------------------------------------------- setup ---
@@ -544,6 +571,16 @@ impl App {
             started: Instant::now(),
             last_update_check: None,
             restart_requested: false,
+            nested: Vec::new(),
+            view_seq: 0,
+            previews: HashMap::new(),
+            remote_ok: HashSet::new(),
+            text_toggle: HashSet::new(),
+            fonts_loaded: HashSet::new(),
+            #[cfg(any(windows, target_os = "macos"))]
+            html_view: None,
+            html_error: if cfg!(any(windows, target_os = "macos")) { None } else { Some("no web view on this platform".into()) },
+            html_target: None,
             acts: Vec::new(),
         };
         for (i, a) in cfg.accounts.into_iter().enumerate() {
@@ -724,6 +761,29 @@ impl App {
                     };
                     continue;
                 }
+                Ev::Link(url) => {
+                    let lower = url.to_ascii_lowercase();
+                    if lower.starts_with("mailto:") {
+                        self.acts.push(Action::ComposeTo(url));
+                    } else if lower.starts_with("https://") || lower.starts_with("http://") {
+                        if let Err(e) = open::that(&url) {
+                            self.status = format!("Couldn't open link: {e}");
+                        }
+                    }
+                    continue;
+                }
+                Ev::Preview { seq, part, image } => {
+                    if seq == self.view_seq {
+                        let p = match image {
+                            Some(img) => {
+                                Preview::Ready(self.ctx.load_texture(format!("preview-{seq}-{part}"), img, egui::TextureOptions::LINEAR))
+                            }
+                            None => Preview::Failed,
+                        };
+                        self.previews.insert((seq, part), p);
+                    }
+                    continue;
+                }
                 Ev::OAuth { editor, result } => {
                     if let Some(ed) = self.editor.as_mut().filter(|e| e.id == editor) {
                         ed.oauth = match result {
@@ -770,7 +830,7 @@ impl App {
                     if self.loading.as_ref() == Some(&key) {
                         self.loading = None;
                         if self.cur.as_ref() == Some(&key) {
-                            self.view = Some(view::parse(raw));
+                            self.set_view(Some(view::parse(raw)));
                         }
                     }
                 }
@@ -813,7 +873,7 @@ impl App {
                     self.open(key);
                     self.scroll_to_cur = true;
                 }
-                Ev::Done { .. } | Ev::Sent { .. } | Ev::OAuth { .. } | Ev::Update(_) => {}
+                Ev::Done { .. } | Ev::Sent { .. } | Ev::OAuth { .. } | Ev::Update(_) | Ev::Link(_) | Ev::Preview { .. } => {}
             }
         }
     }
@@ -1006,6 +1066,8 @@ impl App {
                     || r.s.to.to_lowercase().contains(&f)
             });
         }
+        let sample: String = rows.iter().take(400).map(|r| format!("{} {} ", r.s.subject, r.s.sender())).collect();
+        self.ensure_fonts(&sample);
         self.rows = rows;
     }
 
@@ -1085,7 +1147,7 @@ impl App {
             return;
         }
         self.cur = Some(key.clone());
-        self.view = None;
+        self.set_view(None);
         self.view_error = None;
         self.loading = None;
         let raw = self.bodies.get(&key).cloned().or_else(|| {
@@ -1096,7 +1158,7 @@ impl App {
         match raw {
             Some(raw) => {
                 self.cache_body(key.clone(), raw.clone());
-                self.view = Some(view::parse(raw));
+                self.set_view(Some(view::parse(raw)));
             }
             None => {
                 if self.accts[key.acct].send(Cmd::Body { folder: key.folder.clone(), uid: key.uid }) {
@@ -1166,7 +1228,7 @@ impl App {
         self.rows.retain(|r| !keys.contains(&r.key));
         if self.cur.as_ref().is_some_and(|c| keys.contains(c)) {
             self.cur = None;
-            self.view = None;
+            self.set_view(None);
             self.loading = None;
             if let Some(p) = pos {
                 if let Some(next) = self.rows.get(p.min(self.rows.len().saturating_sub(1))) {
@@ -1610,7 +1672,7 @@ impl App {
 
     fn clear_reader(&mut self) {
         self.cur = None;
-        self.view = None;
+        self.set_view(None);
         self.loading = None;
         self.view_error = None;
     }
@@ -1651,7 +1713,7 @@ impl App {
     }
 
     fn save_attachment(&mut self, i: usize) {
-        let Some(v) = &self.view else { return };
+        let Some(v) = self.nested.last().or(self.view.as_ref()) else { return };
         let Some(a) = v.attachments.get(i) else { return };
         let Some(bytes) = view::part_bytes(&v.raw, a.part) else { return };
         if let Some(path) = rfd::FileDialog::new().set_file_name(view::sanitize_filename(&a.name)).save_file() {
@@ -1664,7 +1726,7 @@ impl App {
 
     fn open_attachment(&mut self, i: usize) {
         let n = self.id();
-        let Some(v) = &self.view else { return };
+        let Some(v) = self.nested.last().or(self.view.as_ref()) else { return };
         let Some(a) = v.attachments.get(i) else { return };
         let name = view::sanitize_filename(&a.name);
         let ext = name.rsplit('.').next().unwrap_or("").to_ascii_lowercase();
@@ -1685,7 +1747,7 @@ impl App {
     }
 
     fn save_eml(&mut self) {
-        let Some(v) = &self.view else { return };
+        let Some(v) = self.nested.last().or(self.view.as_ref()) else { return };
         let name = format!("{}.eml", view::sanitize_filename(&v.subject));
         if let Some(path) = rfd::FileDialog::new().set_file_name(name).add_filter("Email", &["eml"]).save_file() {
             // The original bytes, exactly as received.
@@ -1698,7 +1760,7 @@ impl App {
 
     fn open_html(&mut self) {
         let n = self.id();
-        let Some(v) = &self.view else { return };
+        let Some(v) = self.nested.last().or(self.view.as_ref()) else { return };
         let Some(html) = &v.html else { return };
         let path = std::env::temp_dir().join("mail-rs").join(format!("message-{n:x}.html"));
         let mut data = b"\xEF\xBB\xBF".to_vec(); // BOM: the decoded HTML is UTF-8.
@@ -1895,7 +1957,7 @@ impl App {
             Action::EditAccount(i) => self.open_editor(Some(i)),
             Action::RemoveAccount(i) => self.confirm = Some(Confirm::RemoveAccount(i)),
             Action::ViewSource => {
-                if let Some(v) = &self.view {
+                if let Some(v) = self.nested.last().or(self.view.as_ref()) {
                     const MAX: usize = 4 * 1024 * 1024;
                     let raw = &v.raw[..v.raw.len().min(MAX)];
                     let mut s = String::from_utf8_lossy(raw).into_owned();
@@ -1915,6 +1977,22 @@ impl App {
             Action::RequestClose(id) => self.request_close(id),
             Action::CloseNow(id) => self.close_compose(id),
             Action::Move(d) => self.move_selection(d),
+            Action::Back => {
+                self.nested.pop();
+                self.bump_view();
+            }
+            Action::ToggleHtml(k) => {
+                if !self.text_toggle.remove(&k) {
+                    self.text_toggle.insert(k);
+                }
+            }
+            Action::AllowRemote(k) => {
+                self.remote_ok.insert(k);
+            }
+            Action::OpenNested(i) => self.open_nested(i),
+            Action::AddToCalendar => self.invite_file(true),
+            Action::SaveIcs => self.invite_file(false),
+            Action::Unsubscribe => self.unsubscribe(),
         }
     }
 
@@ -2162,7 +2240,7 @@ impl App {
         let Some(p) = self.pending.last() else { return };
         let label = p.label.clone();
         let left = p.deadline.saturating_duration_since(Instant::now()).as_secs() + 1;
-        egui::Area::new(Id::unique("undo-toast")).order(Order::Foreground).anchor(Align2::CENTER_BOTTOM, egui::vec2(0.0, -34.0)).show(
+        egui::Area::new(Id::unique("undo-toast")).order(Order::Foreground).anchor(Align2::LEFT_BOTTOM, egui::vec2(16.0, -34.0)).show(
             ctx,
             |ui| {
                 egui::Frame::popup(ui.style()).show(ui, |ui| {
@@ -2440,8 +2518,20 @@ impl App {
             });
     }
 
+    fn html_supported(&self) -> bool {
+        cfg!(any(windows, target_os = "macos")) && self.html_error.is_none()
+    }
+
+    /// The message on screen: an opened attached email, or the selected one.
+    fn top_view(&self) -> Option<&View> {
+        self.nested.last().or(self.view.as_ref())
+    }
+
     fn ui_reader(&mut self, root: &mut egui::Ui) {
         let ctx = &root.ctx().clone();
+        let html_ok = self.html_supported();
+        let mut html_target: Option<(Rect, u64)> = None;
+        let mut want_previews: Vec<mail_parser::PartId> = Vec::new();
         egui::CentralPanel::default()
             .frame(egui::Frame::central_panel(&ctx.global_style()).inner_margin(egui::Margin::symmetric(20, 12)))
             .show(root, |ui| {
@@ -2471,45 +2561,67 @@ impl App {
                     });
                     return;
                 }
-                let Some(v) = &self.view else { return };
+                let nested = self.nested.len();
+                let Some(v) = self.nested.last().or(self.view.as_ref()) else { return };
                 let s = self.rows.iter().find(|r| r.key == key).map(|r| r.s.clone()).unwrap_or_default();
                 let in_drafts = self.accts[key.acct].folder_special(&key.folder) == Some(Special::Drafts);
                 let keys = vec![key.clone()];
+                let mut want_html = !self.cfg.settings.prefer_plain_text;
+                if self.text_toggle.contains(&key) {
+                    want_html = !want_html;
+                }
+                let html_mode = want_html && html_ok && v.html.is_some();
+                let allow_remote = self.remote_ok.contains(&key);
 
                 ui.horizontal_wrapped(|ui| {
-                    if in_drafts {
-                        if ui.button("✏ Edit draft").clicked() {
-                            self.acts.push(Action::EditAsNew(true));
+                    if nested > 0 {
+                        if ui.button("← Back").on_hover_text("Return to the message this was attached to").clicked() {
+                            self.acts.push(Action::Back);
+                        }
+                        ui.label(RichText::new("Attached message").weak());
+                        ui.separator();
+                    } else {
+                        if in_drafts {
+                            if ui.button("✏ Edit draft").clicked() {
+                                self.acts.push(Action::EditAsNew(true));
+                            }
+                            ui.separator();
+                        }
+                        if ui.button("↩ Reply").on_hover_text("R").clicked() {
+                            self.acts.push(Action::Reply(false));
+                        }
+                        if ui.button("↩ Reply all").on_hover_text("A").clicked() {
+                            self.acts.push(Action::Reply(true));
+                        }
+                        if ui.button("↪ Forward").on_hover_text("F").clicked() {
+                            self.acts.push(Action::Forward);
                         }
                         ui.separator();
-                    }
-                    if ui.button("↩ Reply").on_hover_text("R").clicked() {
-                        self.acts.push(Action::Reply(false));
-                    }
-                    if ui.button("↩ Reply all").on_hover_text("A").clicked() {
-                        self.acts.push(Action::Reply(true));
-                    }
-                    if ui.button("↪ Forward").on_hover_text("F").clicked() {
-                        self.acts.push(Action::Forward);
-                    }
-                    ui.separator();
-                    if ui.button("🗄").on_hover_text("Archive (E)").clicked() {
-                        self.acts.push(Action::Archive(keys.clone()));
-                    }
-                    if ui.button("🗑").on_hover_text("Delete (Del)").clicked() {
-                        self.acts.push(Action::Trash(keys.clone()));
-                    }
-                    if ui.button(if s.flagged { "★" } else { "☆" }).on_hover_text("Star (S)").clicked() {
-                        self.acts.push(Action::Flag(keys.clone(), MsgFlag::Flagged, !s.flagged));
-                    }
-                    if ui
-                        .button(if s.seen { "✉" } else { "✉•" })
-                        .on_hover_text(if s.seen { "Mark unread (U)" } else { "Mark read (U)" })
-                        .clicked()
-                    {
-                        self.acts.push(Action::Flag(keys.clone(), MsgFlag::Seen, !s.seen));
+                        if ui.button("🗄").on_hover_text("Archive (E)").clicked() {
+                            self.acts.push(Action::Archive(keys.clone()));
+                        }
+                        if ui.button("🗑").on_hover_text("Delete (Del)").clicked() {
+                            self.acts.push(Action::Trash(keys.clone()));
+                        }
+                        if ui.button(if s.flagged { "★" } else { "☆" }).on_hover_text("Star (S)").clicked() {
+                            self.acts.push(Action::Flag(keys.clone(), MsgFlag::Flagged, !s.flagged));
+                        }
+                        if ui
+                            .button(if s.seen { "✉" } else { "✉•" })
+                            .on_hover_text(if s.seen { "Mark unread (U)" } else { "Mark read (U)" })
+                            .clicked()
+                        {
+                            self.acts.push(Action::Flag(keys.clone(), MsgFlag::Seen, !s.seen));
+                        }
                     }
                     ui.menu_button("⋯", |ui| {
+                        if v.html.is_some() {
+                            let label = if html_mode { "Show plain text" } else { "Show formatted (HTML)" };
+                            if ui.add_enabled(html_ok || html_mode, egui::Button::new(label)).clicked() {
+                                self.acts.push(Action::ToggleHtml(key.clone()));
+                                ui.close();
+                            }
+                        }
                         if ui.button("View source").clicked() {
                             self.acts.push(Action::ViewSource);
                             ui.close();
@@ -2527,20 +2639,20 @@ impl App {
                             self.acts.push(Action::OpenHtml);
                             ui.close();
                         }
-                        if ui.button("Edit as new message").clicked() {
+                        if nested == 0 && ui.button("Edit as new message").clicked() {
                             self.acts.push(Action::EditAsNew(false));
                             ui.close();
                         }
-                        ui.checkbox(&mut self.mono, "Monospace body");
+                        ui.checkbox(&mut self.mono, "Monospace plain text");
                     });
                 });
                 ui.add_space(8.0);
 
                 // Headers and attachments get a bounded area so long recipient
                 // lists or many attachments never push the body off screen.
-                let max_head = (ui.available_height() * 0.4).max(120.0);
+                let max_head = (ui.available_height() * 0.5).max(140.0);
                 egui::ScrollArea::vertical()
-                    .id_salt(("head", key.acct, &key.folder, key.uid))
+                    .id_salt(("head", key.acct, &key.folder, key.uid, nested))
                     .max_height(max_head)
                     .auto_shrink([false, true])
                     .show(ui, |ui| {
@@ -2562,18 +2674,70 @@ impl App {
                             }
                             row(ui, "Date", &v.date);
                         });
+                        if !v.unsubscribe.is_empty() {
+                            ui.horizontal(|ui| {
+                                ui.label(RichText::new("Mailing list").small().weak());
+                                if ui.small_button("Unsubscribe").on_hover_text(v.unsubscribe.join("\n")).clicked() {
+                                    self.acts.push(Action::Unsubscribe);
+                                }
+                            });
+                        }
+                        for n in &v.notices {
+                            ui.add(egui::Label::new(RichText::new(n.text()).small().color(ui.visuals().warn_fg_color)).wrap());
+                        }
+                        if let Some((inv, _)) = &v.invite {
+                            ui.add_space(6.0);
+                            egui::Frame::group(ui.style()).show(ui, |ui| {
+                                ui.set_width(ui.available_width());
+                                ui.label(RichText::new(format!("📅 {}", inv.headline())).small().color(ACCENT));
+                                ui.label(RichText::new(&inv.summary).strong().size(16.0));
+                                for (k, val) in [("When", &inv.when), ("Where", &inv.location), ("Organizer", &inv.organizer)] {
+                                    if !val.is_empty() {
+                                        ui.horizontal_wrapped(|ui| {
+                                            ui.label(RichText::new(k).weak());
+                                            ui.label(val.as_str());
+                                        });
+                                    }
+                                }
+                                ui.horizontal(|ui| {
+                                    if ui.button("Add to calendar").on_hover_text("Opens the invitation in your calendar app").clicked() {
+                                        self.acts.push(Action::AddToCalendar);
+                                    }
+                                    if ui.button("Save .ics").clicked() {
+                                        self.acts.push(Action::SaveIcs);
+                                    }
+                                });
+                            });
+                        }
                         if !v.attachments.is_empty() {
                             ui.add_space(6.0);
                             ui.horizontal_wrapped(|ui| {
                                 for (i, a) in v.attachments.iter().enumerate() {
+                                    let icon = if a.is_message {
+                                        "✉"
+                                    } else if a.is_image {
+                                        "🖼"
+                                    } else {
+                                        "📎"
+                                    };
+                                    let hint = if a.is_message {
+                                        "Click to read · right-click for more"
+                                    } else {
+                                        "Click to save · right-click for more"
+                                    };
                                     let r = ui
-                                        .button(format!("📎 {}  ·  {}", a.name, model::fmt_size(a.size)))
-                                        .on_hover_text(format!("{}\nClick to save · right-click for more", a.mime));
+                                        .button(format!("{icon} {}  ·  {}", a.name, model::fmt_size(a.size)))
+                                        .on_hover_text(format!("{}\n{hint}", a.mime));
                                     if r.clicked() {
-                                        self.acts.push(Action::SaveAttachment(i));
+                                        self.acts.push(if a.is_message { Action::OpenNested(i) } else { Action::SaveAttachment(i) });
                                     }
+                                    let is_message = a.is_message;
                                     r.context_menu(|ui| {
-                                        if ui.button("Open").clicked() {
+                                        if is_message && ui.button("Read in Mail").clicked() {
+                                            self.acts.push(Action::OpenNested(i));
+                                            ui.close();
+                                        }
+                                        if !is_message && ui.button("Open").clicked() {
                                             self.acts.push(Action::OpenAttachment(i));
                                             ui.close();
                                         }
@@ -2585,11 +2749,33 @@ impl App {
                                 }
                             });
                         }
-                        if v.from_html {
+                        if html_mode && v.remote_content && !allow_remote {
                             ui.add_space(4.0);
-                            ui.horizontal(|ui| {
-                                ui.label(RichText::new("HTML message shown as text. Remote content is never loaded.").small().weak());
-                                if ui.small_button("Open original in browser").clicked() {
+                            ui.horizontal_wrapped(|ui| {
+                                ui.label(RichText::new("🛡 Remote images are blocked to protect your privacy.").small().weak());
+                                if ui
+                                    .small_button("Load remote content")
+                                    .on_hover_text("The sender may learn that you opened this message")
+                                    .clicked()
+                                {
+                                    self.acts.push(Action::AllowRemote(key.clone()));
+                                }
+                            });
+                        } else if !html_mode && v.html.is_some() {
+                            ui.add_space(4.0);
+                            ui.horizontal_wrapped(|ui| {
+                                let why = match &self.html_error {
+                                    Some(e) if want_html => format!("Shown as text: {e}."),
+                                    _ if !html_ok => "Shown as text.".to_string(),
+                                    _ if v.from_html => "HTML message shown as text.".to_string(),
+                                    _ => "Shown as plain text.".to_string(),
+                                };
+                                ui.label(RichText::new(format!("{why} Remote content is never loaded.")).small().weak());
+                                if html_ok {
+                                    if ui.small_button("Show formatted").clicked() {
+                                        self.acts.push(Action::ToggleHtml(key.clone()));
+                                    }
+                                } else if ui.small_button("Open original in browser").clicked() {
                                     self.acts.push(Action::OpenHtml);
                                 }
                             });
@@ -2598,37 +2784,293 @@ impl App {
                 ui.add_space(6.0);
                 ui.separator();
 
+                if html_mode {
+                    // The native web view is placed over this area after the frame is laid out.
+                    let rect = ui.available_rect_before_wrap();
+                    ui.allocate_rect(rect, Sense::hover());
+                    use std::hash::{Hash, Hasher};
+                    let mut h = std::collections::hash_map::DefaultHasher::new();
+                    (&key, nested, allow_remote, self.view_seq).hash(&mut h);
+                    html_target = Some((rect, h.finish()));
+                    return;
+                }
+
                 let mono = self.mono;
-                egui::ScrollArea::vertical().id_salt(("body", key.acct, &key.folder, key.uid)).auto_shrink([false, false]).show(ui, |ui| {
-                    ui.add_space(6.0);
-                    ui.spacing_mut().item_spacing = egui::vec2(0.0, 0.0);
-                    let font = if mono { FontId::monospace(13.0) } else { FontId::proportional(14.5) };
-                    for b in &v.blocks {
-                        match b {
-                            Block::Text(t) => {
-                                ui.add(egui::Label::new(RichText::new(t).font(font.clone())).wrap().selectable(true));
-                            }
-                            Block::Line(segs) => {
-                                ui.horizontal_wrapped(|ui| {
-                                    for (link, s) in segs {
-                                        let rt = RichText::new(s).font(font.clone());
-                                        if !*link {
-                                            ui.add(egui::Label::new(rt).wrap().selectable(true));
-                                        } else if s.starts_with("mailto:") {
-                                            if ui.link(rt).clicked() {
-                                                self.acts.push(Action::ComposeTo(s.clone()));
+                egui::ScrollArea::vertical().id_salt(("body", key.acct, &key.folder, key.uid, nested)).auto_shrink([false, false]).show(
+                    ui,
+                    |ui| {
+                        ui.add_space(6.0);
+                        ui.spacing_mut().item_spacing = egui::vec2(0.0, 0.0);
+                        let font = if mono { FontId::monospace(13.0) } else { FontId::proportional(14.5) };
+                        for b in &v.blocks {
+                            match b {
+                                Block::Text(t) => {
+                                    ui.add(egui::Label::new(RichText::new(t).font(font.clone())).wrap().selectable(true));
+                                }
+                                Block::Line(segs) => {
+                                    ui.horizontal_wrapped(|ui| {
+                                        for (link, s) in segs {
+                                            let rt = RichText::new(s).font(font.clone());
+                                            if !*link {
+                                                ui.add(egui::Label::new(rt).wrap().selectable(true));
+                                            } else if s.starts_with("mailto:") {
+                                                if ui.link(rt).clicked() {
+                                                    self.acts.push(Action::ComposeTo(s.clone()));
+                                                }
+                                            } else {
+                                                ui.hyperlink_to(rt, s).on_hover_text(s);
                                             }
-                                        } else {
-                                            ui.hyperlink_to(rt, s).on_hover_text(s);
                                         }
-                                    }
-                                });
+                                    });
+                                }
                             }
                         }
-                    }
-                    ui.add_space(24.0);
-                });
+                        // Image attachments are previewed below the text.
+                        ui.spacing_mut().item_spacing = egui::vec2(8.0, 8.0);
+                        for (i, a) in v.attachments.iter().enumerate().filter(|(_, a)| a.is_image) {
+                            ui.add_space(12.0);
+                            match self.previews.get(&(self.view_seq, a.part)) {
+                                Some(Preview::Ready(tex)) => {
+                                    let max_w = ui.available_width().min(640.0);
+                                    let r = ui
+                                        .add(
+                                            egui::Image::new(tex)
+                                                .fit_to_original_size(1.0)
+                                                .max_width(max_w)
+                                                .corner_radius(4.0)
+                                                .sense(Sense::click()),
+                                        )
+                                        .on_hover_text(format!("{} · click to open", a.name));
+                                    if r.clicked() {
+                                        self.acts.push(Action::OpenAttachment(i));
+                                    }
+                                }
+                                Some(Preview::Loading) => {
+                                    ui.spinner();
+                                }
+                                Some(Preview::Failed) => {}
+                                None => want_previews.push(a.part),
+                            }
+                        }
+                        ui.add_space(24.0);
+                    },
+                );
             });
+        self.html_target = html_target;
+        for p in want_previews {
+            self.request_preview(p);
+        }
+    }
+
+    fn request_preview(&mut self, part: mail_parser::PartId) {
+        let Some(v) = self.top_view() else { return };
+        let (raw, seq) = (v.raw.clone(), self.view_seq);
+        self.previews.insert((seq, part), Preview::Loading);
+        let (tx, ctx) = (self.tx.clone(), self.ctx.clone());
+        std::thread::spawn(move || {
+            let image = view::part_bytes(&raw, part).and_then(|b| image::load_from_memory(&b).ok()).map(|img| {
+                let img = img.thumbnail(1400, 1400).to_rgba8();
+                egui::ColorImage::from_rgba_unmultiplied([img.width() as usize, img.height() as usize], img.as_raw())
+            });
+            let _ = tx.send(Event { acct: String::new(), gen: 0, kind: Ev::Preview { seq, part, image } });
+            ctx.request_repaint();
+        });
+    }
+
+    /// Replace the message on screen (resets per-message state).
+    fn set_view(&mut self, v: Option<View>) {
+        if let Some(v) = &v {
+            let sample = format!("{} {} {}", v.subject, v.from, v.text.chars().take(20_000).collect::<String>());
+            self.ensure_fonts(&sample);
+        }
+        self.view = v;
+        self.nested.clear();
+        self.bump_view();
+    }
+
+    fn bump_view(&mut self) {
+        self.view_seq += 1;
+        self.previews.clear();
+    }
+
+    /// Load system fonts for scripts egui's defaults don't cover, the first
+    /// time text in that script is shown (CJK, Hangul, Thai, Indic…).
+    fn ensure_fonts(&mut self, text: &str) {
+        let needs = |lo: u32, hi: u32| text.chars().any(|c| (lo..=hi).contains(&(c as u32)));
+        let scripts: [(&str, bool, &[&str]); 4] = [
+            (
+                "cjk",
+                needs(0x3040, 0x30FF) || needs(0x3400, 0x9FFF) || needs(0xF900, 0xFAFF) || needs(0xFF00, 0xFFEF),
+                &[
+                    "C:\\Windows\\Fonts\\msyh.ttc",
+                    "C:\\Windows\\Fonts\\YuGothM.ttc",
+                    "C:\\Windows\\Fonts\\msgothic.ttc",
+                    "/System/Library/Fonts/Hiragino Sans GB.ttc",
+                    "/System/Library/Fonts/PingFang.ttc",
+                    "/usr/share/fonts/opentype/noto/NotoSansCJK-Regular.ttc",
+                    "/usr/share/fonts/noto-cjk/NotoSansCJK-Regular.ttc",
+                    "/usr/share/fonts/google-noto-cjk/NotoSansCJK-Regular.ttc",
+                ],
+            ),
+            (
+                "hangul",
+                needs(0xAC00, 0xD7AF) || needs(0x1100, 0x11FF) || needs(0x3130, 0x318F),
+                &[
+                    "C:\\Windows\\Fonts\\malgun.ttf",
+                    "/System/Library/Fonts/AppleSDGothicNeo.ttc",
+                    "/usr/share/fonts/opentype/noto/NotoSansCJK-Regular.ttc",
+                    "/usr/share/fonts/truetype/nanum/NanumGothic.ttf",
+                ],
+            ),
+            (
+                "thai",
+                needs(0x0E00, 0x0E7F),
+                &[
+                    "C:\\Windows\\Fonts\\LeelawUI.ttf",
+                    "/System/Library/Fonts/Supplemental/Thonburi.ttc",
+                    "/usr/share/fonts/truetype/noto/NotoSansThai-Regular.ttf",
+                ],
+            ),
+            (
+                "indic",
+                needs(0x0900, 0x0DFF),
+                &[
+                    "C:\\Windows\\Fonts\\Nirmala.ttc",
+                    "C:\\Windows\\Fonts\\Nirmala.ttf",
+                    "/System/Library/Fonts/Kohinoor.ttc",
+                    "/usr/share/fonts/truetype/noto/NotoSansDevanagari-Regular.ttf",
+                ],
+            ),
+        ];
+        for (name, needed, paths) in scripts {
+            if !needed || self.fonts_loaded.contains(name) {
+                continue;
+            }
+            self.fonts_loaded.insert(name);
+            if let Some(bytes) = paths.iter().find_map(|p| std::fs::read(p).ok()) {
+                use egui::epaint::text::{FontInsert, FontPriority, InsertFontFamily};
+                let fams = [FontFamily::Proportional, FontFamily::Monospace]
+                    .into_iter()
+                    .map(|family| InsertFontFamily { family, priority: FontPriority::Lowest })
+                    .collect();
+                self.ctx.add_font(FontInsert::new(name, egui::FontData::from_owned(bytes), fams));
+            }
+        }
+    }
+
+    /// Place, fill and show/hide the native HTML view to match the reader.
+    #[cfg(any(windows, target_os = "macos"))]
+    fn sync_webview(&mut self, ctx: &egui::Context, frame: &eframe::Frame) {
+        let Some((rect, key)) = self.html_target.take() else {
+            if let Some(h) = &mut self.html_view {
+                h.set_visible(false);
+            }
+            return;
+        };
+        if self.html_view.is_none() && self.html_error.is_none() {
+            let (tx, c) = (self.tx.clone(), ctx.clone());
+            let on_link = move |url: String| {
+                let _ = tx.send(Event { acct: String::new(), gen: 0, kind: Ev::Link(url) });
+                c.request_repaint();
+            };
+            match crate::html::HtmlView::new(frame, crate::config::cache_dir().join("webview"), on_link) {
+                Ok(v) => self.html_view = Some(v),
+                Err(e) => {
+                    self.html_error = Some(e);
+                    return;
+                }
+            }
+        }
+        let Some(hv) = self.html_view.as_mut() else { return };
+        let Some(v) = self.nested.last().or(self.view.as_ref()) else { return };
+        let allow_remote = self.cur.as_ref().is_some_and(|k| self.remote_ok.contains(k));
+        hv.show(key, || crate::html::Page {
+            html: crate::html::prepare(v.html.as_deref().unwrap_or("")),
+            raw: v.raw.clone(),
+            cids: v.cids.clone(),
+            allow_remote,
+        });
+        // Native child windows draw above egui, so shrink to the largest
+        // uncovered part when a window or menu overlaps, or hide if too little is left.
+        let covers: Vec<Rect> = ctx.memory(|m| {
+            m.areas()
+                .visible_layer_ids()
+                .into_iter()
+                .filter(|l| matches!(l.order, Order::Middle | Order::Foreground))
+                .filter_map(|l| m.area_rect(l.id))
+                .filter(|r| r.intersects(rect))
+                .collect()
+        });
+        let full = rect;
+        let mut rect = rect;
+        for c in covers {
+            if !c.intersects(rect) {
+                continue;
+            }
+            let options = [
+                Rect::from_min_max(rect.min, egui::pos2(c.left(), rect.bottom())),
+                Rect::from_min_max(egui::pos2(c.right(), rect.top()), rect.max),
+                Rect::from_min_max(rect.min, egui::pos2(rect.right(), c.top())),
+                Rect::from_min_max(egui::pos2(rect.left(), c.bottom()), rect.max),
+            ];
+            rect = options.into_iter().filter(|r| r.is_positive()).max_by(|a, b| a.area().total_cmp(&b.area())).unwrap_or(Rect::NOTHING);
+        }
+        let overlapped = !rect.is_positive() || rect.area() < full.area() * 0.25 || rect.width() < 200.0;
+        let ppp = ctx.pixels_per_point();
+        hv.place(
+            (rect.min.x * ppp).round() as i32,
+            (rect.min.y * ppp).round() as i32,
+            (rect.width() * ppp).round() as u32,
+            (rect.height() * ppp).round() as u32,
+        );
+        hv.set_visible(!overlapped && rect.width() > 8.0 && rect.height() > 8.0);
+    }
+
+    #[cfg(not(any(windows, target_os = "macos")))]
+    fn sync_webview(&mut self, _ctx: &egui::Context, _frame: &eframe::Frame) {
+        self.html_target = None;
+    }
+
+    fn open_nested(&mut self, i: usize) {
+        let Some(v) = self.top_view() else { return };
+        let Some(a) = v.attachments.get(i) else { return };
+        let Some(bytes) = view::part_bytes(&v.raw, a.part) else { return };
+        let nv = view::parse(Arc::new(bytes));
+        let sample = format!("{} {}", nv.subject, nv.text.chars().take(20_000).collect::<String>());
+        self.ensure_fonts(&sample);
+        self.nested.push(nv);
+        self.bump_view();
+    }
+
+    fn invite_file(&mut self, open_it: bool) {
+        let n = self.id();
+        let Some((_, data)) = self.top_view().and_then(|v| v.invite.clone()) else { return };
+        if open_it {
+            let path = std::env::temp_dir().join("mail-rs").join(format!("invite-{n:x}.ics"));
+            let r = std::fs::create_dir_all(path.parent().unwrap())
+                .and_then(|_| std::fs::write(&path, &data))
+                .map_err(|e| e.to_string())
+                .and_then(|_| open::that(&path).map_err(|e| e.to_string()));
+            if let Err(e) = r {
+                self.status = format!("Couldn't open the invitation: {e}");
+            }
+        } else if let Some(path) = rfd::FileDialog::new().set_file_name("invite.ics").add_filter("Calendar", &["ics"]).save_file() {
+            self.status = match std::fs::write(&path, &data) {
+                Ok(()) => format!("Saved {}", path.display()),
+                Err(e) => format!("Could not save: {e}"),
+            };
+        }
+    }
+
+    fn unsubscribe(&mut self) {
+        let Some(targets) = self.top_view().map(|v| v.unsubscribe.clone()) else { return };
+        if let Some(url) = targets.iter().find(|u| u.starts_with("https://") || u.starts_with("http://")) {
+            if let Err(e) = open::that(url) {
+                self.status = format!("Couldn't open the unsubscribe page: {e}");
+            }
+        } else if let Some(m) = targets.iter().find(|u| u.starts_with("mailto:")) {
+            self.acts.push(Action::ComposeTo(m.clone()));
+        }
     }
 
     /// Which compose window holds keyboard focus, if any.
@@ -3062,6 +3504,12 @@ impl App {
                 changed |= ui.checkbox(&mut s.mark_read_on_open, "Mark messages read when opened").changed();
                 ui.end_row();
                 ui.label("");
+                changed |= ui
+                    .checkbox(&mut s.prefer_plain_text, "Prefer plain text over HTML")
+                    .on_hover_text("Show the text version of messages that have both. You can switch per message from the ⋯ menu.")
+                    .changed();
+                ui.end_row();
+                ui.label("");
                 changed |= ui.checkbox(&mut s.notifications, "Desktop notifications for new mail").changed();
                 ui.end_row();
                 ui.label("");
@@ -3384,7 +3832,7 @@ impl eframe::App for App {
         self.update_title();
     }
 
-    fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
+    fn ui(&mut self, ui: &mut egui::Ui, frame: &mut eframe::Frame) {
         let ctx = ui.ctx().clone();
         self.ui_top(ui);
         self.ui_update_banner(ui);
@@ -3400,6 +3848,7 @@ impl eframe::App for App {
         self.shortcuts(&ctx);
         self.autosave();
         self.guard_exit(&ctx);
+        self.sync_webview(&ctx, frame);
 
         let acts = std::mem::take(&mut self.acts);
         if !acts.is_empty() {
