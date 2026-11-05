@@ -48,7 +48,7 @@ pub struct View {
     pub blocks: Vec<Block>,
     pub html: Option<String>,
     pub from_html: bool,
-    /// The HTML references remote images/styles/fonts (blocked by default).
+    /// The HTML references remote images/styles/fonts.
     pub remote_content: bool,
     /// Inline parts by Content-ID (lowercase, no angle brackets): (mime, part).
     #[cfg_attr(not(any(windows, target_os = "macos")), allow(dead_code))]

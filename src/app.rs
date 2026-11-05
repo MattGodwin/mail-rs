@@ -2571,7 +2571,7 @@ impl App {
                     want_html = !want_html;
                 }
                 let html_mode = want_html && html_ok && v.html.is_some();
-                let allow_remote = self.remote_ok.contains(&key);
+                let allow_remote = self.cfg.settings.load_remote_content || self.remote_ok.contains(&key);
 
                 ui.horizontal_wrapped(|ui| {
                     if nested > 0 {
@@ -2983,7 +2983,7 @@ impl App {
         }
         let Some(hv) = self.html_view.as_mut() else { return };
         let Some(v) = self.nested.last().or(self.view.as_ref()) else { return };
-        let allow_remote = self.cur.as_ref().is_some_and(|k| self.remote_ok.contains(k));
+        let allow_remote = self.cfg.settings.load_remote_content || self.cur.as_ref().is_some_and(|k| self.remote_ok.contains(k));
         hv.show(key, || crate::html::Page {
             html: crate::html::prepare(v.html.as_deref().unwrap_or("")),
             raw: v.raw.clone(),
@@ -3507,6 +3507,12 @@ impl App {
                 changed |= ui
                     .checkbox(&mut s.prefer_plain_text, "Prefer plain text over HTML")
                     .on_hover_text("Show the text version of messages that have both. You can switch per message from the ⋯ menu.")
+                    .changed();
+                ui.end_row();
+                ui.label("");
+                changed |= ui
+                    .checkbox(&mut s.load_remote_content, "Load remote images automatically")
+                    .on_hover_text("Also allows remote styles and fonts. Senders may learn when you open their messages. Turn off to load remote content per message.")
                     .changed();
                 ui.end_row();
                 ui.label("");

@@ -110,6 +110,8 @@ pub struct Settings {
     pub auto_update: bool,
     /// Show the plain-text version of messages instead of HTML when both exist.
     pub prefer_plain_text: bool,
+    /// Allow remote images, styles and fonts when displaying HTML mail.
+    pub load_remote_content: bool,
 }
 
 impl Default for Settings {
@@ -126,6 +128,7 @@ impl Default for Settings {
             default_account: String::new(),
             auto_update: true,
             prefer_plain_text: false,
+            load_remote_content: true,
         }
     }
 }

@@ -1,6 +1,6 @@
 [package]
 name = "mail-rs"
-version = "0.1.2"
+version = "0.1.3"
 edition = "2021"
 description = "A fast, minimal, multi-account desktop email client that never modifies your mail"
 repository = "https://github.com/MattGodwin/mail-rs"

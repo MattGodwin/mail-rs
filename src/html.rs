@@ -4,8 +4,8 @@
 //! - The message is served from memory over a private `mailview:` scheme;
 //!   inline `cid:` images come from the message's own MIME parts.
 //! - A Content-Security-Policy blocks all scripts, forms, frames and plugins,
-//!   and blocks remote images, styles and fonts (tracking pixels) unless the
-//!   user chooses "Load remote content" for that message.
+//!   and optionally blocks remote images, styles and fonts. Remote content
+//!   loads by default; Settings can require per-message permission instead.
 //! - Navigation never happens inside the view: clicked links open in the
 //!   system browser, and `mailto:` links open a compose window.
 //!
@@ -230,7 +230,7 @@ mod tests {
     }
 
     #[test]
-    fn policy_blocks_scripts_and_remote_by_default() {
+    fn policy_blocks_scripts_and_can_block_remote_content() {
         let p = csp(false);
         assert!(p.contains("script-src 'none'"));
         assert!(p.contains("img-src 'self' data:;"));
