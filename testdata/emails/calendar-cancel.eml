@@ -1,0 +1,44 @@
+From: Alex Morgan <alex@example.org>
+To: Sam Reader <sam@example.net>
+Date: Thu, 5 Nov 2026 10:00:00 +0000
+Message-ID: <calendar-cancel@example.org>
+Subject: Courtyard review cancelled
+MIME-Version: 1.0
+Content-Type: multipart/alternative; boundary="calendar-42"
+
+--calendar-42
+Content-Type: text/plain; charset=utf-8
+
+The courtyard meeting is cancelled.
+
+--calendar-42
+Content-Type: text/calendar; charset=utf-8; method=CANCEL
+
+BEGIN:VCALENDAR
+VERSION:2.0
+PRODID:-//Example Garden//Meetings//EN
+METHOD:CANCEL
+BEGIN:VTIMEZONE
+TZID:Europe/London
+BEGIN:STANDARD
+DTSTART:20261025T020000
+TZOFFSETFROM:+0100
+TZOFFSETTO:+0000
+END:STANDARD
+END:VTIMEZONE
+BEGIN:VEVENT
+UID:courtyard-review@example.org
+DTSTAMP:20261105T100000Z
+SEQUENCE:1
+SUMMARY:Courtyard review cancelled
+DTSTART;TZID=Europe/London:20261110T143000
+DTEND;TZID=Europe/London:20261110T153000
+LOCATION:Room 4\, garden office
+ORGANIZER;CN="Priya Shah":mailto:priya@example.org
+ATTENDEE;CN="Sam Reader";RSVP=TRUE:mailto:sam@example.net
+DESCRIPTION:Review planting\nBring notes.
+STATUS:CANCELLED
+END:VEVENT
+END:VCALENDAR
+
+--calendar-42--

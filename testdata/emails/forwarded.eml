@@ -1,0 +1,28 @@
+From: Alex Morgan <alex@example.org>
+To: Sam Reader <sam@example.net>
+Date: Thu, 5 Nov 2026 10:00:00 +0000
+Message-ID: <forwarded@example.org>
+Subject: Fwd: Bulb order confirmation
+MIME-Version: 1.0
+Content-Type: multipart/mixed; boundary="forward-42"
+
+--forward-42
+Content-Type: text/plain; charset=utf-8
+
+Here is the nursery confirmation.
+
+--forward-42
+Content-Type: message/rfc822
+Content-Disposition: attachment; filename="order.eml"
+
+From: Nursery Sales <sales@nursery.example>
+To: Alex Morgan <alex@example.org>
+Subject: Bulb order confirmation
+Date: Wed, 4 Nov 2026 15:00:00 +0000
+Message-ID: <order-42@nursery.example>
+MIME-Version: 1.0
+Content-Type: text/plain; charset=utf-8
+
+Your order of twenty tulip bulbs is confirmed.
+
+--forward-42--

@@ -1,0 +1,21 @@
+From: Alex Morgan <alex@example.org>
+To: Sam Reader <sam@example.net>
+Date: Thu, 5 Nov 2026 10:00:00 +0000
+Message-ID: <related@example.org>
+Subject: Courtyard planting plan
+MIME-Version: 1.0
+Content-Type: multipart/related; boundary="related-42"
+
+--related-42
+Content-Type: text/html; charset=utf-8
+
+<html><body><p>Our courtyard plan.</p><img src="cid:Plan@Garden"></body></html>
+--related-42
+Content-Type: image/png
+Content-ID: <Plan@Garden>
+Content-Disposition: inline; filename="plan.png"
+Content-Transfer-Encoding: base64
+
+iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR4nGNQaDjwHwAEhAJgikCezQAAAABJRU5ErkJggg==
+
+--related-42--

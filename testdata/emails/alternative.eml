@@ -1,0 +1,23 @@
+From: Alex Morgan <alex@example.org>
+To: Sam Reader <sam@example.net>
+Date: Thu, 5 Nov 2026 10:00:00 +0000
+Message-ID: <alternative@example.org>
+Subject: Re: launch checklist
+MIME-Version: 1.0
+Cc: Priya Shah <priya@example.org>, QA <qa@example.org>
+Bcc: Archive <archive@example.net>
+Reply-To: Launch Team <launch@example.org>
+References: <kickoff@example.org> <review@example.org>
+Content-Type: multipart/alternative; boundary="alternative-42"
+
+--alternative-42
+Content-Type: text/plain; charset=utf-8
+
+The launch checklist is ready.
+Please review by Friday.
+
+--alternative-42
+Content-Type: text/html; charset=utf-8
+
+<html><body><p>The <b>launch checklist</b> is ready.</p></body></html>
+--alternative-42--

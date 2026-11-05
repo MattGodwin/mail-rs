@@ -1,2 +1,4 @@
 * text=auto
 *.rs text eol=lf
+# CRLF and trailing spaces are wire data (notably format=flowed).
+testdata/emails/*.eml -text whitespace=cr-at-eol,-blank-at-eol

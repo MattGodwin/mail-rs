@@ -1,0 +1,21 @@
+From: Alex Morgan <alex@example.org>
+To: Sam Reader <sam@example.net>
+Date: Thu, 5 Nov 2026 10:00:00 +0000
+Message-ID: <image-attachment@example.org>
+Subject: Photo of the courtyard
+MIME-Version: 1.0
+Content-Type: multipart/mixed; boundary="photo-42"
+
+--photo-42
+Content-Type: text/plain; charset=utf-8
+
+Here is the courtyard photo.
+
+--photo-42
+Content-Type: image/png; name="courtyard.png"
+Content-Disposition: attachment; filename="courtyard.png"
+Content-Transfer-Encoding: base64
+
+iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR4nGNQaDjwHwAEhAJgikCezQAAAABJRU5ErkJggg==
+
+--photo-42--

@@ -1,0 +1,11 @@
+From: Garden Weekly <news@example.org>
+To: Sam Reader <sam@example.net>
+Date: Thu, 5 Nov 2026 10:00:00 +0000
+Message-ID: <newsletter@example.org>
+Subject: November garden notes
+MIME-Version: 1.0
+List-Unsubscribe: <https://news.example.org/unsubscribe?id=42>,
+ <mailto:leave@example.org?subject=unsubscribe>
+Content-Type: text/html; charset=utf-8
+
+<!doctype html><html><head><meta http-equiv="refresh" content="0;url=https://news.example.org/latest"><link rel="stylesheet" href="https://cdn.example.org/news.css"></head><body><h1>November garden notes</h1><div style="background-image: url(https://cdn.example.org/leaves.png)">Plant bulbs before frost.</div><img src="https://track.example.org/open.gif?id=42" width="1" height="1"><img src="cid:Logo@Garden"><a href="https://news.example.org">Read more</a></body></html>

@@ -1,0 +1,38 @@
+From: Mail Delivery System <mailer-daemon@example.org>
+To: Sam Reader <sam@example.net>
+Date: Thu, 5 Nov 2026 10:00:00 +0000
+Message-ID: <delivery-failure@example.org>
+Subject: Delivery Status Notification (Failure)
+MIME-Version: 1.0
+Content-Type: multipart/report; boundary="dsn-42"; report-type=delivery-status
+
+--dsn-42
+Content-Type: text/plain; charset=utf-8
+
+Delivery to missing@example.net failed permanently.
+
+--dsn-42
+Content-Type: message/delivery-status
+
+Reporting-MTA: dns; mx.example.org
+
+Final-Recipient: rfc822; missing@example.net
+Action: failed
+Status: 5.1.1
+Diagnostic-Code: smtp; 550 No such user
+
+--dsn-42
+Content-Type: message/rfc822
+Content-Disposition: attachment; filename="original.eml"
+
+From: Nursery Sales <sales@nursery.example>
+To: Alex Morgan <alex@example.org>
+Subject: Bulb order confirmation
+Date: Wed, 4 Nov 2026 15:00:00 +0000
+Message-ID: <order-42@nursery.example>
+MIME-Version: 1.0
+Content-Type: text/plain; charset=utf-8
+
+Your order of twenty tulip bulbs is confirmed.
+
+--dsn-42--

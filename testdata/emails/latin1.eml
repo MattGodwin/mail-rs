@@ -1,0 +1,10 @@
+From: =?ISO-8859-1?Q?Andr=E9_Martin?= <andre@example.org>
+To: Sam Reader <sam@example.net>
+Date: Thu, 5 Nov 2026 10:00:00 +0000
+Message-ID: <latin1@example.org>
+Subject: =?ISO-8859-1?Q?Caf=E9_r=E9sum=E9?=
+MIME-Version: 1.0
+Content-Type: text/plain; charset=ISO-8859-1
+Content-Transfer-Encoding: quoted-printable
+
+Un caf=E9 pour Andr=E9.

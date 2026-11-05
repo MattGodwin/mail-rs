@@ -1,0 +1,11 @@
+From: Alex Morgan <alex@example.org>
+To: Sam Reader <sam@example.net>
+Date: Thu, 5 Nov 2026 10:00:00 +0000
+Message-ID: <smime-encrypted@example.org>
+Subject: Confidential supplier terms
+MIME-Version: 1.0
+Content-Type: application/pkcs7-mime; smime-type=enveloped-data; name="smime.p7m"
+Content-Disposition: attachment; filename="smime.p7m"
+Content-Transfer-Encoding: base64
+
+MAMCAQA=

@@ -22,7 +22,8 @@ pub fn unflow(text: &str, delsp: bool) -> String {
             para.clear();
         }
     };
-    for raw in text.split('\n') {
+    // A terminal newline ends the last line; it does not add an empty line.
+    for raw in text.split_terminator('\n') {
         let line = raw.strip_suffix('\r').unwrap_or(raw);
         let d = line.chars().take_while(|&c| c == '>').count();
         let mut content = &line[d..];

@@ -1,0 +1,21 @@
+From: Alex Morgan <alex@example.org>
+To: Sam Reader <sam@example.net>
+Date: Thu, 5 Nov 2026 10:00:00 +0000
+Message-ID: <smime-signed@example.org>
+Subject: Signed budget approval
+MIME-Version: 1.0
+Content-Type: multipart/signed; boundary="smime-42"; protocol="application/pkcs7-signature"; micalg=sha-256
+
+--smime-42
+Content-Type: text/plain; charset=utf-8
+
+I approve the garden budget.
+
+--smime-42
+Content-Type: application/pkcs7-signature; name="smime.p7s"
+Content-Disposition: attachment; filename="smime.p7s"
+Content-Transfer-Encoding: base64
+
+MAMCAQA=
+
+--smime-42--

@@ -1,0 +1,17 @@
+From: Alex Morgan <alex@example.org>
+To: Sam Reader <sam@example.net>
+Date: Thu, 5 Nov 2026 10:00:00 +0000
+Message-ID: <flowed@example.org>
+Subject: Re: weekend planting
+MIME-Version: 1.0
+Content-Type: text/plain; charset=utf-8; format=flowed
+
+We can plant the bulbs 
+this Saturday.
+
+> Bring the spare 
+> gardening gloves.
+ >literal greater-than
+ From the garden team
+-- 
+Alex

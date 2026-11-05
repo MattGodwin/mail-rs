@@ -1,0 +1,16 @@
+From: Alex Morgan <alex@example.org>
+To: Sam Reader <sam@example.net>
+Date: Thu, 5 Nov 2026 10:00:00 +0000
+Message-ID: <pgp-inline@example.org>
+Subject: Inline signed order
+MIME-Version: 1.0
+Content-Type: text/plain; charset=utf-8
+
+-----BEGIN PGP SIGNED MESSAGE-----
+Hash: SHA256
+
+Please order twenty bulbs.
+-----BEGIN PGP SIGNATURE-----
+
+VGhpcyBpcyBhIHRlc3QgZml4dHVyZS4=
+-----END PGP SIGNATURE-----

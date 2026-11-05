@@ -5,6 +5,8 @@ mod app;
 mod compose;
 mod config;
 mod drafts;
+#[cfg(test)]
+mod fixture_tests;
 mod formats;
 mod html;
 mod http;
