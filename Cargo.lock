@@ -1267,6 +1267,7 @@ dependencies = [
  "egui-winit",
  "egui_glow",
  "egui_system_font_provider",
+ "glow",
  "glutin",
  "glutin-winit",
  "image",
@@ -2922,7 +2923,7 @@ dependencies = [
 
 [[package]]
 name = "mail-rs"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "base64 0.23.1",
  "chrono",

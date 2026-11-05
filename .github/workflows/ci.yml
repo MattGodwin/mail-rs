@@ -15,27 +15,23 @@ concurrency:
 
 env:
   CARGO_TERM_COLOR: always
-  RUSTFLAGS: -D warnings
+  # Note: no global RUSTFLAGS. It would replace the per-target flags in
+  # .cargo/config.toml (static C runtime on Windows) that releases use.
+  # Warnings are enforced by clippy on every OS instead.
 
 jobs:
-  lint:
-    name: Format & clippy
+  fmt:
+    name: Format
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v7
       - uses: dtolnay/rust-toolchain@stable
         with:
-          components: rustfmt, clippy
-      - uses: Swatinem/rust-cache@v2
-      - name: Install Linux build dependencies
-        run: |
-          sudo apt-get update
-          sudo apt-get install -y libssl-dev pkg-config libxkbcommon-dev libxcb-render0-dev libxcb-shape0-dev libxcb-xfixes0-dev
+          components: rustfmt
       - run: cargo fmt --all --check
-      - run: cargo clippy --locked --all-targets -- -D warnings
 
   test:
-    name: Test (${{ matrix.os }})
+    name: Clippy & test (${{ matrix.os }})
     runs-on: ${{ matrix.os }}
     strategy:
       fail-fast: false
@@ -44,11 +40,20 @@ jobs:
     steps:
       - uses: actions/checkout@v7
       - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy
       - uses: Swatinem/rust-cache@v2
       - name: Install Linux build dependencies
         if: runner.os == 'Linux'
         run: |
           sudo apt-get update
           sudo apt-get install -y libssl-dev pkg-config libxkbcommon-dev libxcb-render0-dev libxcb-shape0-dev libxcb-xfixes0-dev
-      - run: cargo build --locked
+      - run: cargo clippy --locked --all-targets -- -D warnings
       - run: cargo test --locked
+      - name: Check the Windows build needs no Visual C++ runtime
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          cargo build --locked
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          ./scripts/check-windows-runtime.ps1 -Executable target/debug/mail-rs.exe

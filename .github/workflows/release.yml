@@ -84,6 +84,10 @@ jobs:
         run: cargo test --locked --release --target ${{ matrix.target }}
       - name: Build
         run: cargo build --locked --release --target ${{ matrix.target }}
+      - name: Check Windows runtime dependencies
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: ./scripts/check-windows-runtime.ps1 -Executable target/${{ matrix.target }}/release/mail-rs.exe
       - name: Package
         shell: bash
         run: |

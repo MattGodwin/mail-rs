@@ -147,6 +147,24 @@ Inbox shortcuts never fire while a compose window or dialog has focus. Right-cli
 
 ## Building from source
 
+### Windows startup problems
+
+If an older release does nothing when opened, install the latest version again.
+Starting with v0.1.1, Windows builds include the C runtime and do not require a
+separate Visual C++ Redistributable installation. If the default graphics renderer
+fails, Mail retries with OpenGL and remembers it after successful initialization.
+
+Startup diagnostics and Rust panics are recorded in
+`%LOCALAPPDATA%\mail-rs\cache\crash.log`. If the app still cannot open, include
+that file when reporting the problem. You can also try OpenGL explicitly in PowerShell:
+
+```powershell
+$env:MAIL_RENDERER = "glow"
+& "$env:LOCALAPPDATA\Programs\Mail\mail-rs.exe"
+```
+
+### Build instructions
+
 You need Rust (`rustup`, stable toolchain).
 
 ```sh
