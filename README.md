@@ -9,6 +9,8 @@ A fast, minimal desktop email client written in Rust. It works with any IMAP/SMT
 (Gmail, Outlook/Hotmail/Microsoft 365, iCloud, Yahoo, Fastmail and others), keeps all your
 accounts signed in side by side, and **never modifies your messages**.
 
+![Mail showing two accounts, the unified inbox and an HTML newsletter](docs/screenshots/reading-light.png)
+
 ## Install
 
 **[Download the latest release](https://github.com/MattGodwin/mail-rs/releases/latest):**
@@ -27,9 +29,13 @@ release's SHA-256 checksums.
 - **Portable copies:** the executable is replaced in place and the new version runs the next
   time you open Mail.
 
-Turn this off, or check manually, in **Settings → Updates**.
+Turn this off, or check manually, in **Settings → About & updates**.
 
 - Single native binary of about 9 MB. The window opens in about a third of a second.
+- **A calm, familiar layout:** an Outlook-style folder pane, a message list with hover actions
+  (archive, delete, read, star) and multi-select, a reading pane, and Gmail-style compose windows
+  docked at the bottom right. Light and dark themes follow your system, and the icons are
+  Material Symbols throughout.
 - **Push mail:** new messages arrive within seconds over IMAP IDLE, with polling as a fallback.
   Desktop notifications appear even while the window is minimised.
 - **Multiple accounts at once:** a unified inbox, every folder of every account, live status
@@ -42,8 +48,9 @@ Turn this off, or check manually, in **Settings → Updates**.
   quitting waits for anything still being sent.
 - **HTML email renders properly.** It uses the system web engine (WebView2 on Windows,
   WebKit on macOS), locked down so scripts never run. Remote images load automatically;
-  turn off **Load remote images automatically** in Settings to require permission per
-  message. Links open in your browser.
+  turn off **Load remote images, styles and fonts** in **Settings → Privacy** to require
+  permission per message. Links open in your browser. Popups and compose windows overlay the
+  email without moving it.
 - **Common email types are handled:**
   - calendar invitations (with *Add to calendar*);
   - inline and attached images (with previews);
@@ -57,6 +64,17 @@ Turn this off, or check manually, in **Settings → Updates**.
 - Save or open attachments (executables are save-only), or save the original `.eml`.
 - Keyboard driven (press `?` in the app).
 
+## Screenshots
+
+| | |
+|---|---|
+| ![Dark theme](docs/screenshots/reading-dark.png) | ![Replying in a docked compose window](docs/screenshots/compose-light.png) |
+| Dark theme follows your system | Compose docks at the bottom right; the email underneath never moves |
+| ![A calendar invitation](docs/screenshots/invite-light.png) | ![Adding an account](docs/screenshots/setup-light.png) |
+| Calendar invitations become a card with *Add to calendar* | Adding an account: email, sign in, verify, done |
+
+![Settings, Accounts page](docs/screenshots/settings-dark.png)
+
 ## Leaving your email alone
 
 - **Messages are cached byte for byte.** They're fetched with `BODY.PEEK[]` and stored as
@@ -67,7 +85,7 @@ Turn this off, or check manually, in **Settings → Updates**.
 - **Remote images load automatically by default.** HTML mail is rendered from a display copy
   served from memory. Scripts, forms and frames stay blocked. To block remote images,
   styles and fonts until you click *Load remote content* for a message, turn off
-  **Load remote images automatically** in Settings. Remote content can tell senders when
+  **Load remote images, styles and fonts** in **Settings → Privacy**. Remote content can tell senders when
   you open their messages. The stored message is never altered.
 - **Outgoing mail is sent exactly as typed.** It's plain text; attachments and forwarded
   attachments go out unchanged.
@@ -97,9 +115,19 @@ Turn this off, or check manually, in **Settings → Updates**.
 
 ## Adding accounts
 
-Click **+ Account**, choose your provider and enter your address. Server settings are filled
-in for you, and the dialog shows step-by-step instructions and links for the sign-in method you
-pick. Choose **Other** to enter any IMAP/SMTP server by hand.
+Click **Add account** (at the bottom of the folder pane) and follow four steps:
+
+1. **Email:** enter your address. Mail finds the server settings for you: from its list of
+   known providers, Mozilla's settings database, your domain's own autoconfig file, or the
+   domain's mail hosting (so Google Workspace and Microsoft 365 domains are recognised). Only
+   the domain is looked up, never your address.
+2. **Sign in:** with your browser (OAuth) or an app password, with step-by-step instructions
+   and links for your provider.
+3. **Verify:** Mail signs in to incoming and outgoing mail and sends nothing.
+4. **Done:** open your inbox, or add another account.
+
+*Set up manually* (on the first step) lets you enter any IMAP/SMTP server by hand. Edit an
+account later in **Settings → Accounts**; Mail asks before discarding unsaved changes.
 
 | Provider | Sign-in |
 |---|---|
@@ -181,7 +209,7 @@ organisation-wide policy:
 | `R` / `A` / `F` | Reply / Reply all / Forward |
 | `E` | Archive |
 | `Del` / `Backspace` / `#` | Delete (move to Trash; in Trash, delete permanently after confirming) |
-| `Ctrl+Z` | Undo the last archive / delete / move (within 5 seconds) |
+| `Ctrl+Z` | Undo the last archive / delete / move (within 10 seconds) |
 | `U` / `S` | Toggle read / star |
 | `/` | Focus the filter (`Enter` searches the server, `Esc` clears) |
 | `F5` | Check for new mail |
@@ -189,7 +217,8 @@ organisation-wide policy:
 | `?` | Show all shortcuts |
 
 Inbox shortcuts never fire while a compose window or dialog has focus. Right-click a message for
-*Move to*, or an account name to edit, pause or remove it.
+*Move to*. Use the **⋮** button next to an account in the folder pane to edit, pause or
+remove it. Ctrl-click and Shift-click select several messages.
 
 ## Building from source
 
@@ -278,7 +307,12 @@ Removing an account deletes its cache and stored credentials. Nothing is deleted
 | File | Purpose |
 |---|---|
 | `src/main.rs` | Entry point and window setup |
-| `src/app.rs` | UI: panels, list, reader, compose windows, account editor, undo, exit guard |
+| `src/app.rs` | UI: panels, list, reader, compose windows, settings, setup wizard, undo, exit guard |
+| `src/theme.rs` | Colour tokens (light and dark), type scale, fonts and widget styling |
+| `src/kit.rs` | UI building blocks: buttons, switches, nav rows, notices, empty states, settings rows |
+| `src/appicon.rs` | The app icon, drawn from the same geometry as `scripts/make_icon.py` |
+| `src/autoconfig.rs` | Finding server settings from an address (ISPDB, domain autoconfig, MX lookup) |
+| `src/admin.rs` | Recognising Microsoft 365 errors only an IT admin can fix, with the link or command to send them |
 | `src/worker.rs` | Per-account IMAP thread: prioritised queue, sync, acknowledged mutations, polling, notifications |
 | `src/watcher.rs` | Push mail: IMAP IDLE connection with watchdog, backoff and sleep/resume handling |
 | `src/net.rs` | Connecting and authenticating (password or XOAUTH2), error classification |

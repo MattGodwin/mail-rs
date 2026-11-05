@@ -44,7 +44,12 @@ pub fn has_remote_content(html: &str) -> bool {
 
 /// The display copy of an HTML body.
 pub fn prepare(html: &str) -> String {
-    rewrite_cid(&strip_auto_navigation(html))
+    // Emails are designed for a light page: keep the web view's scrollbars and
+    // form controls light even when Windows is in dark mode. Appended, so the
+    // sender's doctype (and rendering mode) is untouched.
+    let mut out = rewrite_cid(&strip_auto_navigation(html));
+    out.push_str("<style>:root{color-scheme:light}</style>");
+    out
 }
 
 /// Content-Security-Policy for a message page.

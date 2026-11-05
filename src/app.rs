@@ -2625,7 +2625,13 @@ impl App {
         let p = kit::pal(ui);
         let line = |ui: &mut egui::Ui, icon, color, text: &str, tip: &str| {
             ui.label(kit::glyph(icon, 16.0, color));
-            ui.label(RichText::new(text).size(ty::META).color(color)).on_hover_text(tip);
+            // Leave room for the action link after it.
+            let w = (ui.available_width() - 96.0).max(40.0);
+            let g = kit::one_line(ui, text.to_string(), FontId::proportional(ty::META), color, w);
+            ui.label(g).on_hover_text(format!(
+                "{text}
+{tip}"
+            ));
         };
         let link = |ui: &mut egui::Ui, text: &str| {
             ui.add(egui::Button::new(RichText::new(text).size(ty::META).color(p.accent)).frame(false)).clicked()
@@ -2734,16 +2740,22 @@ impl App {
                         // Account heading: name, collapse, and an explicit overflow menu.
                         ui.horizontal(|ui| {
                             ui.set_height(28.0);
-                            let head = ui.add(
-                                egui::Button::new(
-                                    RichText::new(a.cfg.label()).font(theme::semibold(ty::META + 1.0)).color(p.text_secondary),
-                                )
-                                .frame(false),
+                            // Long addresses are shortened so the chevron and menu always fit.
+                            let label_w = (ui.available_width() - 32.0 - 24.0).max(40.0);
+                            let g =
+                                kit::one_line(ui, a.cfg.label().to_string(), theme::semibold(ty::META + 1.0), p.text_secondary, label_w);
+                            let head = ui.add(egui::Label::new(g).sense(Sense::click())).on_hover_text(a.cfg.label());
+                            let chevron = ui.add(
+                                egui::Label::new(kit::glyph(
+                                    if open { ic::ICON_EXPAND_LESS } else { ic::ICON_EXPAND_MORE },
+                                    16.0,
+                                    p.text_disabled,
+                                ))
+                                .sense(Sense::click()),
                             );
-                            if head.clicked() {
+                            if head.clicked() || chevron.clicked() {
                                 ctx.data_mut(|d| d.insert_temp(id, !open));
                             }
-                            ui.label(kit::glyph(if open { ic::ICON_EXPAND_LESS } else { ic::ICON_EXPAND_MORE }, 16.0, p.text_disabled));
                             ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
                                 ui.menu_button(kit::glyph(ic::ICON_MORE_VERT, 18.0, p.text_secondary), |ui| {
                                     if ui.button("Account settings…").clicked() {
@@ -4016,9 +4028,14 @@ impl App {
                         egui::Frame::new().inner_margin(egui::Margin { left: 12, right: 12, top: 4, bottom: 0 }).show(ui, |ui| {
                             match crate::admin::classify(e, "", &from_addr) {
                                 Some(issue) => {
-                                    let text = format!("{}. Copy the fix to send to your IT admin.", issue.short);
-                                    if kit::notice(ui, Tone::Warning, &text, Some(issue.copy_label)) {
-                                        ui.ctx().copy_text(issue.copy_text.clone());
+                                    let text = format!("{}. Copy the details for your IT admin.", issue.short);
+                                    if kit::notice(ui, Tone::Warning, &text, Some("Copy details")) {
+                                        ui.ctx().copy_text(format!(
+                                            "{}
+
+{}",
+                                            issue.explain, issue.copy_text
+                                        ));
                                         self_status_copied = true;
                                     }
                                 }
@@ -5497,61 +5514,6 @@ impl eframe::App for App {
             self.rebuild_rows();
         }
         self.update_title();
-        // TEMP demo hook
-        static N: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
-        let n = N.fetch_add(1, Ordering::Relaxed);
-        if let Ok(i) = std::env::var("MAIL_DEMO_OPEN") {
-            if n == 2 && std::env::var("MAIL_DEMO_PANEL").is_ok_and(|v| v.starts_with("small")) {
-                ctx.send_viewport_cmd(egui::ViewportCommand::InnerSize(egui::vec2(760.0, 440.0)));
-            }
-            if n == 8 {
-                if let Some(r) = self.rows.get(i.parse::<usize>().unwrap_or(0)) {
-                    let k = r.key.clone();
-                    self.open(k);
-                }
-            }
-            if n == 20 {
-                match std::env::var("MAIL_DEMO_PANEL").as_deref() {
-                    Ok("settings") => self.settings_open = true,
-                    Ok("editor") => self.open_editor(None),
-                    Ok("compose") => self.reply(false),
-                    Ok("accounts") => {
-                        self.settings_open = true;
-                        self.settings_page = SettingsPage::Accounts;
-                    }
-                    Ok("privacy") => {
-                        self.settings_open = true;
-                        self.settings_page = SettingsPage::Privacy;
-                    }
-                    Ok("admin") => self.open_editor(Some(0)),
-                    Ok("small-compose") => {
-                        self.reply(false);
-                        if let Some(c) = self.composes.last_mut() {
-                            c.error = Some("permanent error (535): 5.7.139 Authentication unsuccessful, SmtpClientAuthentication is disabled for the Mailbox.".into());
-                        }
-                    }
-                    Ok("small-setup") => self.open_editor(None),
-                    Ok("composes") => {
-                        for _ in 0..4 {
-                            let a = self.current_acct();
-                            self.new_compose(a);
-                        }
-                    }
-                    _ => {}
-                }
-            }
-            if n >= 20 && std::env::var("MAIL_DEMO_PANEL").as_deref() == Ok("admin") {
-                if let Some(a) = self.accts.get_mut(0) {
-                    a.cfg.oauth_client_id = "8a3f1c2e-0b7d-4e59-9c61-2f4d8e7a1b30".into();
-                    a.state = AcctState::AuthFailed(
-                        "invalid_grant: AADSTS65001: The user or administrator has not consented to use the application.".into(),
-                    );
-                }
-            }
-            if n < 80 {
-                ctx.request_repaint();
-            }
-        }
     }
 
     fn ui(&mut self, ui: &mut egui::Ui, frame: &mut eframe::Frame) {
