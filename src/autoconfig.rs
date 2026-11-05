@@ -15,6 +15,11 @@ pub enum Found {
     Servers { imap: Server, smtp: Server, local_user: bool, source: &'static str },
 }
 
+/// A plausible address: something@domain.tld with no spaces.
+pub fn looks_like_email(email: &str) -> bool {
+    email.split_once('@').is_some_and(|(l, _)| !l.is_empty() && !l.contains(char::is_whitespace)) && domain(email).is_some()
+}
+
 fn domain(email: &str) -> Option<String> {
     let d = email.rsplit_once('@')?.1.trim().to_ascii_lowercase();
     (!d.is_empty() && d.contains('.') && d.chars().all(|c| c.is_ascii_alphanumeric() || c == '.' || c == '-')).then_some(d)

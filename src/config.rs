@@ -165,7 +165,20 @@ fn config_path() -> PathBuf {
 
 impl Config {
     pub fn load() -> Config {
-        std::fs::read(config_path()).ok().and_then(|b| serde_json::from_slice(&b).ok()).unwrap_or_default()
+        let path = config_path();
+        let Ok(bytes) = std::fs::read(&path) else { return Config::default() };
+        // Tolerate a UTF-8 byte-order mark (Notepad and PowerShell add one).
+        let body = bytes.strip_prefix(b"\xEF\xBB\xBF").unwrap_or(&bytes);
+        match serde_json::from_slice(body) {
+            Ok(c) => c,
+            Err(e) => {
+                // Keep the unreadable file so the next save can't destroy the user's accounts.
+                let backup = path.with_extension("json.unreadable");
+                let _ = std::fs::copy(&path, &backup);
+                eprintln!("config.json could not be read ({e}); a copy was kept at {}", backup.display());
+                Config::default()
+            }
+        }
     }
 
     pub fn save(&self) -> Result<(), String> {

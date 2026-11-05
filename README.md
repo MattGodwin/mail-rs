@@ -128,6 +128,42 @@ Saving it in **Settings** pre-fills it for new accounts.
 3. *Credentials* → *Create credentials* → *OAuth client ID* → **Desktop app**.
 4. Copy the client ID and secret into Mail.
 
+### IT admin setup (Microsoft 365 work and school accounts)
+
+Some organisations block new apps or turn off IMAP/SMTP. Mail recognises these errors, explains
+them, and gives you a link or command to copy. This section is meant to be forwarded to your IT
+admin.
+
+**"Need admin approval"** (`AADSTS65001`, `AADSTS90094`, `AADSTS90095`): the tenant requires an
+admin to approve the app. A Global Administrator, Application Administrator or Cloud Application
+Administrator opens this link, signs in and accepts. Replace `YOUR_CLIENT_ID` with the client ID
+the user entered in Mail (Mail fills it in for you when it shows the error):
+
+```
+https://login.microsoftonline.com/organizations/v2.0/adminconsent?client_id=YOUR_CLIENT_ID&scope=https%3A%2F%2Foutlook.office.com%2FIMAP.AccessAsUser.All+https%3A%2F%2Foutlook.office.com%2FSMTP.Send+offline_access&redirect_uri=http%3A%2F%2Flocalhost
+```
+
+Mail asks only for `IMAP.AccessAsUser.All`, `SMTP.Send` and `offline_access`.
+
+**Sending fails with `5.7.139`** (SMTP AUTH is disabled): enable it for the user's mailbox in
+[Exchange Online PowerShell](https://learn.microsoft.com/powershell/exchange/connect-to-exchange-online-powershell):
+
+```powershell
+Connect-ExchangeOnline
+Set-CASMailbox -Identity user@yourdomain.com -SmtpClientAuthenticationDisabled $false
+```
+
+**Reading mail fails** ("User is authenticated but not connected", or IMAP disabled): enable IMAP
+for the mailbox:
+
+```powershell
+Set-CASMailbox -Identity user@yourdomain.com -ImapEnabled $true
+```
+
+Both changes are per mailbox and can take up to an hour to apply. Security defaults or
+Conditional Access policies that block "legacy authentication" don't affect Mail, because Mail
+signs in with OAuth (modern authentication).
+
 ## Keyboard shortcuts
 
 | Key | Action |

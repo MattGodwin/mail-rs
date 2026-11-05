@@ -168,7 +168,9 @@ pub fn lerp(a: Color32, b: Color32, t: f32) -> Color32 {
 /// An on/off switch. Returns true when toggled.
 pub fn switch(ui: &mut Ui, on: &mut bool, label: &str) -> Response {
     let p = pal(ui);
-    let (rect, mut resp) = ui.allocate_exact_size(egui::vec2(36.0, 20.0), Sense::click());
+    // 36×20 track inside a 44×32 hit area.
+    let (hit, mut resp) = ui.allocate_exact_size(egui::vec2(44.0, 32.0), Sense::click());
+    let rect = Rect::from_center_size(hit.center(), egui::vec2(36.0, 20.0));
     if resp.clicked() {
         *on = !*on;
         resp.mark_changed();
@@ -185,6 +187,34 @@ pub fn switch(ui: &mut Ui, on: &mut bool, label: &str) -> Response {
         }
     }
     resp
+}
+
+/// A switch followed by its label; clicking either toggles. Returns true when changed.
+pub fn switch_labeled(ui: &mut Ui, on: &mut bool, label: &str) -> bool {
+    let p = pal(ui);
+    ui.horizontal(|ui| {
+        let mut changed = switch(ui, on, label).changed();
+        let color = if ui.is_enabled() { p.text } else { p.text_disabled };
+        if ui.add(egui::Label::new(RichText::new(label).color(color)).sense(Sense::click())).clicked() {
+            *on = !*on;
+            changed = true;
+        }
+        changed
+    })
+    .inner
+}
+
+/// A settings row whose control is a switch; the whole text block toggles it too.
+pub fn setting_switch(ui: &mut Ui, title: &str, help: &str, on: &mut bool) -> bool {
+    let mut changed = false;
+    let text_clicked = setting_row_inner(ui, title, help, |ui| {
+        changed |= switch(ui, on, title).changed();
+    });
+    if text_clicked && ui.is_enabled() {
+        *on = !*on;
+        changed = true;
+    }
+    changed
 }
 
 /// Initials for a display name or address.
@@ -331,21 +361,31 @@ pub fn empty_state(ui: &mut Ui, icon: MaterialIcon, title: &str, detail: &str, a
 
 /// A settings row: title and help on the left, control on the right.
 pub fn setting_row(ui: &mut Ui, title: &str, help: &str, control: impl FnOnce(&mut Ui)) {
+    setting_row_inner(ui, title, help, control);
+}
+
+/// Returns true when the title/help block was clicked.
+fn setting_row_inner(ui: &mut Ui, title: &str, help: &str, control: impl FnOnce(&mut Ui)) -> bool {
     let p = pal(ui);
-    ui.horizontal(|ui| {
-        let w = ui.available_width();
-        ui.allocate_ui_with_layout(egui::vec2((w - 220.0).max(200.0), 0.0), egui::Layout::top_down(egui::Align::Min), |ui| {
-            ui.label(RichText::new(title).color(p.text));
-            if !help.is_empty() {
-                ui.add(egui::Label::new(RichText::new(help).size(ty::META).color(p.text_secondary)).wrap());
-            }
-        });
-        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), control);
-    });
-    ui.add_space(6.0);
+    let clicked = ui
+        .horizontal(|ui| {
+            let w = ui.available_width();
+            let text =
+                ui.allocate_ui_with_layout(egui::vec2((w - 220.0).max(200.0), 0.0), egui::Layout::top_down(egui::Align::Min), |ui| {
+                    ui.label(RichText::new(title).color(if ui.is_enabled() { p.text } else { p.text_disabled }));
+                    if !help.is_empty() {
+                        ui.add(egui::Label::new(RichText::new(help).size(ty::META).color(p.text_secondary)).wrap());
+                    }
+                });
+            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), control);
+            ui.interact(text.response.rect, text.response.id.with("row"), Sense::click()).clicked()
+        })
+        .inner;
+    ui.add_space(8.0);
     let r = ui.available_rect_before_wrap();
     ui.painter().hline(r.x_range(), r.top(), Stroke::new(1.0, p.divider));
-    ui.add_space(10.0);
+    ui.add_space(12.0);
+    clicked
 }
 
 pub fn section_title(ui: &mut Ui, text: &str) {
@@ -357,4 +397,10 @@ pub fn section_title(ui: &mut Ui, text: &str) {
 /// Text input styled for the theme (flat, 36 high).
 pub fn text_field<'a>(text: &'a mut dyn egui::TextBuffer, hint: &str) -> egui::TextEdit<'a> {
     egui::TextEdit::singleline(text).hint_text(hint).margin(egui::Margin::symmetric(10, 8)).min_size(egui::vec2(0.0, 36.0))
+}
+
+/// A Material chevron for combo boxes, replacing egui's filled triangle.
+pub fn combo_chevron(ui: &Ui, rect: Rect, visuals: &egui::style::WidgetVisuals, open: bool) {
+    let icon = if open { ic::ICON_EXPAND_LESS } else { ic::ICON_EXPAND_MORE };
+    paint_icon(ui, rect.expand(4.0), icon, false, 18.0, visuals.fg_stroke.color);
 }

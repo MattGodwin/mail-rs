@@ -147,7 +147,13 @@ fn prefixed(prefix: &str, subject: &str) -> String {
 
 fn quote(v: &View) -> String {
     let mut q = String::new();
+    let mut blank = 0;
     for line in v.text.lines() {
+        // Collapse runs of blank lines (common in text converted from HTML).
+        blank = if line.trim().is_empty() { blank + 1 } else { 0 };
+        if blank > 1 {
+            continue;
+        }
         q.push_str(if line.starts_with('>') { ">" } else { "> " });
         q.push_str(line);
         q.push('\n');

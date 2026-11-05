@@ -158,7 +158,9 @@ pub fn parse(raw: Arc<Vec<u8>>) -> View {
     if !has_plain {
         if let Some(h) = &html {
             // If conversion fails, fall back to mail-parser's simpler HTML-to-text.
-            text = html2text::config::plain_no_decorate()
+            // Plain prose: no markdown heading marks or box-drawn table borders.
+            text = html2text::config::with_decorator(html2text::render::TrivialDecorator::new())
+                .no_table_borders()
                 .string_from_read(h.as_bytes(), 110)
                 .unwrap_or_else(|_| msg.body_text(0).map(|t| t.into_owned()).unwrap_or_default());
             from_html = true;
@@ -172,6 +174,7 @@ pub fn parse(raw: Arc<Vec<u8>>) -> View {
     // Inline parts, calendar data and formats that need explaining.
     let mut cids = HashMap::new();
     let mut invite = None;
+    let mut invite_part = None;
     let mut notices = Vec::new();
     for p in msg.parts() {
         let ct = p.content_type();
@@ -183,6 +186,7 @@ pub fn parse(raw: Arc<Vec<u8>>) -> View {
             let data = p.decoded().into_owned();
             if let Some(inv) = formats::parse_invite(&String::from_utf8_lossy(&data)) {
                 invite = Some((inv, data));
+                invite_part = Some(p.id());
             }
         }
         let protocol = ct.as_ref().and_then(|c| c.attribute("protocol"));
@@ -207,6 +211,8 @@ pub fn parse(raw: Arc<Vec<u8>>) -> View {
     let attachments = msg
         .attachments()
         .filter(|p| !p.content_id().is_some_and(shown_inline))
+        // The invite card already offers this calendar part (Add to calendar / Save .ics).
+        .filter(|p| Some(p.id()) != invite_part || p.attachment_name().is_some())
         .map(|p| {
             let mime = mime_of(p.content_type());
             let mime = if p.content_type().is_none() { "application/octet-stream".to_string() } else { mime };
