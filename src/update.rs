@@ -12,9 +12,7 @@
 use semver::Version;
 use serde::Deserialize;
 use sha2::{Digest, Sha256};
-use std::io::Read;
 use std::path::{Path, PathBuf};
-use std::sync::Arc;
 use std::time::Duration;
 
 pub const REPO: &str = "MattGodwin/mail-rs";
@@ -106,23 +104,13 @@ pub fn mode() -> Mode {
 }
 
 fn agent() -> Result<ureq::Agent, String> {
-    let tls = native_tls::TlsConnector::new().map_err(|e| e.to_string())?;
-    Ok(ureq::AgentBuilder::new()
-        .tls_connector(Arc::new(tls))
-        .timeout_connect(Duration::from_secs(15))
-        .timeout_read(Duration::from_secs(60))
-        .user_agent(concat!("mail-rs-updater/", env!("CARGO_PKG_VERSION")))
-        .build())
+    Ok(crate::http::agent(Duration::from_secs(10 * 60)))
 }
 
 fn get(agent: &ureq::Agent, url: &str) -> Result<Vec<u8>, String> {
-    let resp = agent.get(url).call().map_err(|e| match e {
-        ureq::Error::Status(code, _) => format!("HTTP {code} from {url}"),
-        e => e.to_string(),
-    })?;
-    let mut buf = Vec::new();
-    resp.into_reader().take(MAX_DOWNLOAD).read_to_end(&mut buf).map_err(|e| e.to_string())?;
-    Ok(buf)
+    let mut resp = agent.get(url).header("Accept", "application/vnd.github+json").call().map_err(|e| e.to_string())?;
+    crate::http::ensure_ok(&mut resp, url)?;
+    resp.body_mut().with_config().limit(MAX_DOWNLOAD).read_to_vec().map_err(|e| e.to_string())
 }
 
 /// The newest published (non-draft, non-pre-release) release.
@@ -303,5 +291,15 @@ mod tests {
         let r: GhRelease = serde_json::from_str(json).unwrap();
         assert_eq!(Version::parse(r.tag_name.trim_start_matches('v')).unwrap(), Version::new(9, 1, 0));
         assert!(Version::new(9, 1, 0) > current());
+    }
+
+    /// Live check against GitHub (network): `cargo test -- --ignored`.
+    #[test]
+    #[ignore]
+    fn live_latest_release() {
+        match latest() {
+            Ok(r) => assert!(r.assets.iter().any(|a| a.name == "SHA256SUMS.txt"), "release lacks checksums"),
+            Err(e) => assert!(e.contains("No releases"), "unexpected error: {e}"),
+        }
     }
 }

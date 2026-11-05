@@ -5,6 +5,7 @@ mod app;
 mod compose;
 mod config;
 mod drafts;
+mod http;
 mod model;
 mod net;
 mod notify;

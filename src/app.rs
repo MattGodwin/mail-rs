@@ -1047,7 +1047,8 @@ impl App {
         }
         self.was_focused = focused;
         // Updates: first check shortly after launch, then daily.
-        if self.cfg.settings.auto_update && update::platform().is_some() && self.staged.is_none() {
+        // Development builds never update themselves automatically.
+        if !cfg!(debug_assertions) && self.cfg.settings.auto_update && update::platform().is_some() && self.staged.is_none() {
             let due = match self.last_update_check {
                 None => self.started.elapsed() >= Duration::from_secs(10),
                 Some(t) => t.elapsed() >= Duration::from_secs(24 * 3600),

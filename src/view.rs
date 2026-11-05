@@ -123,7 +123,8 @@ pub fn parse(raw: Arc<Vec<u8>>) -> View {
     let mut from_html = false;
     if !has_plain {
         if let Some(h) = &html {
-            text = html2text::from_read(h.as_bytes(), 110);
+            // If conversion fails, fall back to mail-parser's simpler HTML-to-text.
+            text = html2text::from_read(h.as_bytes(), 110).unwrap_or_else(|_| msg.body_text(0).map(|t| t.into_owned()).unwrap_or_default());
             from_html = true;
         }
     }

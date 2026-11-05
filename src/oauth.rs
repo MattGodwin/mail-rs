@@ -106,13 +106,12 @@ fn random_token() -> String {
 }
 
 fn post_token(url: &str, form: &[(&str, &str)]) -> Result<TokenResponse, String> {
-    let tls = native_tls::TlsConnector::new().map_err(|e| e.to_string())?;
-    let agent = ureq::AgentBuilder::new().tls_connector(Arc::new(tls)).timeout(Duration::from_secs(30)).build();
-    match agent.post(url).send_form(form) {
-        Ok(r) => r.into_json::<TokenResponse>().map_err(|e| format!("Invalid token response: {e}")),
-        Err(ureq::Error::Status(code, r)) => Err(format!("Token endpoint returned HTTP {code}: {}", r.into_string().unwrap_or_default())),
-        Err(e) => Err(format!("Token request failed: {e}")),
-    }
+    let mut resp = crate::http::agent(Duration::from_secs(30))
+        .post(url)
+        .send_form(form.iter().copied())
+        .map_err(|e| format!("Token request failed: {e}"))?;
+    crate::http::ensure_ok(&mut resp, "Token endpoint")?;
+    resp.body_mut().read_json::<TokenResponse>().map_err(|e| format!("Invalid token response: {e}"))
 }
 
 fn cache_token(account_id: &str, t: &TokenResponse) {
