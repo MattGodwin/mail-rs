@@ -23,7 +23,7 @@ jobs:
     name: Check tag matches Cargo.toml
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
         with:
           ref: ${{ env.TAG }}
       - name: Compare versions
@@ -60,7 +60,7 @@ jobs:
             target: x86_64-apple-darwin
             bin: mail-rs
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
         with:
           ref: ${{ env.TAG }}
       - uses: dtolnay/rust-toolchain@stable
